@@ -9,16 +9,27 @@ const OmniBox = require("omnibox_sdk");
 
 // ========== 全局配置 [1] ==========
 const host = 'https://rrsp-api.kejiqianxian.com:60425';
+const DANMU_API = process.env.DANMU_API || '';
 const def_headers = {
     'User-Agent': 'rrsp.wang',
     'origin': '*',
+    'sec-fetch-dest': 'empty',
+    'sec-fetch-mode': 'cors',
+    'sec-fetch-site': 'cross-site',
+    'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+};
+
+const headers = {
+    ...def_headers,
     'Accept': 'application/json, text/plain, */*',
-    'Content-Type': 'application/json'
+    'Content-Type': 'application/json',
+    'accept-language': 'zh-CN'
 };
 
 const axiosInstance = axios.create({
-    httpsAgent: new https.Agent({ rejectUnauthorized: false }),
-    timeout: 15000
+    httpsAgent: new https.Agent({ rejectUnauthorized: false })
 });
 
 /**
@@ -42,11 +53,127 @@ const fixPicUrl = (url) => {
     return url.startsWith('/') ? `${host}${url}` : `${host}/${url}`;
 };
 
+// ========== 弹幕工具函数 ==========
+const preprocessTitle = (title) => {
+    if (!title) return "";
+    return title
+        .replace(/4[kK]|[xX]26[45]|720[pP]|1080[pP]|2160[pP]/g, " ")
+        .replace(/[hH]\.?26[45]/g, " ")
+        .replace(/BluRay|WEB-DL|HDR|REMUX/gi, " ")
+        .replace(/\.mp4|\.mkv|\.avi|\.flv/gi, " ");
+};
+
+const chineseToArabic = (cn) => {
+    const map = { '零': 0, '一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9, '十': 10 };
+    if (!isNaN(cn)) return parseInt(cn, 10);
+    if (cn.length === 1) return map[cn] || cn;
+    if (cn.length === 2) {
+        if (cn[0] === '十') return 10 + map[cn[1]];
+        if (cn[1] === '十') return map[cn[0]] * 10;
+    }
+    if (cn.length === 3) return map[cn[0]] * 10 + map[cn[2]];
+    return cn;
+};
+
+const extractEpisode = (title) => {
+    if (!title) return "";
+    const processedTitle = preprocessTitle(title).trim();
+
+    const cnMatch = processedTitle.match(/第\s*([零一二三四五六七八九十0-9]+)\s*[集话章节回期]/);
+    if (cnMatch) return String(chineseToArabic(cnMatch[1]));
+
+    const seMatch = processedTitle.match(/[Ss](?:\d{1,2})?[-._\s]*[Ee](\d{1,3})/i);
+    if (seMatch) return seMatch[1];
+
+    const epMatch = processedTitle.match(/\b(?:EP|E)[-._\s]*(\d{1,3})\b/i);
+    if (epMatch) return epMatch[1];
+
+    const bracketMatch = processedTitle.match(/[\[\(【(](\d{1,3})[\]\)】)]/);
+    if (bracketMatch) {
+        const num = bracketMatch[1];
+        if (!["720", "1080", "480"].includes(num)) return num;
+    }
+
+    return "";
+};
+
+const buildFileNameForDanmu = (vodName, episodeTitle) => {
+    if (!vodName) return "";
+    if (!episodeTitle || episodeTitle === '正片' || episodeTitle === '播放') return vodName;
+
+    const digits = extractEpisode(episodeTitle);
+    if (digits) {
+        const epNum = parseInt(digits, 10);
+        if (epNum > 0) {
+            if (epNum < 10) return `${vodName} S01E0${epNum}`;
+            return `${vodName} S01E${epNum}`;
+        }
+    }
+    return vodName;
+};
+
+const matchDanmu = async (fileName) => {
+    if (!DANMU_API || !fileName) return [];
+
+    try {
+        logInfo(`匹配弹幕: ${fileName}`);
+        const matchUrl = `${DANMU_API}/api/v2/match`;
+        const response = await OmniBox.request(matchUrl, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            },
+            body: JSON.stringify({ fileName }),
+        });
+
+        if (response.statusCode !== 200) {
+            logInfo(`弹幕匹配失败: HTTP ${response.statusCode}`);
+            return [];
+        }
+
+        const matchData = JSON.parse(response.body);
+        if (!matchData.isMatched) {
+            logInfo("弹幕未匹配到");
+            return [];
+        }
+
+        const matches = matchData.matches || [];
+        if (matches.length === 0) return [];
+
+        const firstMatch = matches[0];
+        const episodeId = firstMatch.episodeId;
+        const animeTitle = firstMatch.animeTitle || "";
+        const episodeTitle = firstMatch.episodeTitle || "";
+        if (!episodeId) return [];
+
+        let danmakuName = "弹幕";
+        if (animeTitle && episodeTitle) {
+            danmakuName = `${animeTitle} - ${episodeTitle}`;
+        } else if (animeTitle) {
+            danmakuName = animeTitle;
+        } else if (episodeTitle) {
+            danmakuName = episodeTitle;
+        }
+
+        const danmakuURL = `${DANMU_API}/api/v2/comment/${episodeId}?format=xml`;
+        logInfo(`弹幕匹配成功: ${danmakuName}`);
+
+        return [{
+            name: danmakuName,
+            url: danmakuURL,
+        }];
+    } catch (error) {
+        logInfo(`弹幕匹配失败: ${error.message}`);
+        return [];
+    }
+};
+
 /**
  * 核心：解析 CMS 字符串为结构化播放源 [1][2]
  * 逻辑：将 "来源1$$$来源2" 和 "第1集$ID1#第2集$ID2" 转换为 UI 识别的数组
  */
-const parsePlaySources = (fromStr, urlStr) => {
+const parsePlaySources = (fromStr, urlStr, vodName = '') => {
     logInfo("开始解析播放源字符串", { from: fromStr, url: urlStr });
     const playSources = [];
     if (!fromStr || !urlStr) return playSources;
@@ -57,12 +184,14 @@ const parsePlaySources = (fromStr, urlStr) => {
     for (let i = 0; i < froms.length; i++) {
         const sourceName = froms[i] || `线路${i + 1}`;
         const sourceItems = urls[i] ? urls[i].split('#') : [];
-        
+
         const episodes = sourceItems.map(item => {
             const parts = item.split('$');
+            const episodeName = parts[0] || '正片';
+            const actualPlayId = parts[1] || parts[0];
             return {
-                name: parts[0] || '正片',
-                playId: parts[1] || parts[0]
+                name: episodeName,
+                playId: `${actualPlayId}|${vodName}|${episodeName}`
             };
         }).filter(e => e.playId);
 
@@ -78,12 +207,24 @@ const parsePlaySources = (fromStr, urlStr) => {
 };
 
 const arr2vods = (arr) => {
-    return (arr || []).map(i => ({
-        vod_id: String(i.vod_id),
-        vod_name: i.vod_name,
-        vod_pic: fixPicUrl(i.vod_pic),
-        vod_remarks: i.vod_serial === '1' ? `${i.vod_serial}集` : `评分:${i.vod_score || '0'}`
-    }));
+    const videos = [];
+    if (!arr) return videos;
+    for (const i of arr) {
+        let remarks;
+        if (i.vod_serial === '1') {
+            remarks = `${i.vod_serial}集`;
+        } else {
+            remarks = `评分:${i.vod_score || i.vod_douban_score || ''}`;
+        }
+        videos.push({
+            vod_id: i.vod_id,
+            vod_name: i.vod_name,
+            vod_pic: i.vod_pic,
+            vod_remarks: remarks,
+            vod_year: null
+        });
+    }
+    return videos;
 };
 
 // ========== 接口实现 ==========
@@ -99,7 +240,7 @@ async function home(params) {
             { 'type_id': '4', 'type_name': '纪录片' },
             { 'type_id': '6', 'type_name': '短剧' }
         ],
-        list: [] 
+        list: []
     };
 }
 
@@ -113,15 +254,19 @@ async function category(params) {
             sort: 'vod_time',
             page: pg,
             limit: '60'
-        }, { headers: def_headers });
+        }, { headers: headers });
 
         logInfo("分类接口返回原始数据", res.data);
-        
-        return {
+
+        const r = {
             list: arr2vods(res.data.data.list),
             page: res.data.data.page || pg,
             pagecount: res.data.data.pagecount || 100
         };
+
+        OmniBox.log("info", `category r：${JSON.stringify(r)}`)
+
+        return r;
     } catch (e) {
         logError("分类请求失败", e);
         return { list: [], page: pg, pagecount: 0 };
@@ -132,13 +277,13 @@ async function detail(params) {
     const videoId = params.videoId;
     logInfo(`请求详情 ID: ${videoId}`);
     try {
-        const res = await axiosInstance.post(`${host}/api.php/player/details/`, { id: videoId }, { headers: def_headers });
+        const res = await axiosInstance.post(`${host}/api.php/player/details/`, { id: videoId }, { headers: headers });
         const data = res.data.detailData;
-        
+
         logInfo("详情接口返回原始数据", data);
 
         // 修复：补全图片并解析播放源 [1][2]
-        const playSources = parsePlaySources(data.vod_play_from, data.vod_play_url);
+        const playSources = parsePlaySources(data.vod_play_from, data.vod_play_url, data.vod_name);
 
         return {
             list: [{
@@ -168,8 +313,8 @@ async function search(params) {
             keyword: wd,
             page: pg,
             limit: '20'
-        }, { headers: def_headers });
-        
+        }, { headers: headers });
+
         const data = res.data.data;
         const videos = [...arr2vods(data.chasingFanCorrelation), ...arr2vods(data.moviesCorrelation)];
 
@@ -185,8 +330,19 @@ async function search(params) {
 }
 
 async function play(params) {
-    const playId = params.playId;
+    let playId = params.playId;
     logInfo(`准备播放 ID: ${playId}`);
+    let vodName = "";
+    let episodeName = "";
+
+    if (playId && playId.includes('|')) {
+        const parts = playId.split('|');
+        playId = parts.shift() || '';
+        vodName = parts.shift() || '';
+        episodeName = parts.join('|') || '';
+        logInfo(`解析透传信息 - 视频: ${vodName}, 集数: ${episodeName}`);
+    }
+
     let url = '';
 
     try {
@@ -200,11 +356,27 @@ async function play(params) {
     const finalUrl = (url && url.startsWith('http')) ? url : playId;
     logInfo(`最终播放地址: ${finalUrl}`);
 
-    return {
+    const playResponse = {
         urls: [{ name: "极速云", url: finalUrl }],
         parse: 0,
         header: { ...def_headers, 'referer': 'https://docs.qq.com/' }
     };
+
+    if (DANMU_API && vodName) {
+        const fileName = buildFileNameForDanmu(vodName, episodeName);
+        logInfo(`尝试匹配弹幕文件名: ${fileName}`);
+        if (fileName) {
+            const danmakuList = await matchDanmu(fileName);
+            if (danmakuList && danmakuList.length > 0) {
+                playResponse.danmaku = danmakuList;
+                logInfo(`弹幕已添加到播放响应`);
+            }
+        }
+    } else if (!DANMU_API) {
+        logInfo("DANMU_API 未配置，跳过弹幕匹配");
+    }
+
+    return playResponse;
 }
 
 module.exports = { home, category, search, detail, play };
