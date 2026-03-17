@@ -1,8 +1,8 @@
 // @name 小雅
 // @author @sifanss
-// @description 必填参数：BASE_URL，XIAOYA_TOKEN
+// @description 必填参数：BASE_URL，XIAOYA_TOKEN。刮削：支持，弹幕：支持
 // @dependencies: axios
-// @version 1.0.1
+// @version 1.0.2
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/网盘/小雅.js
 
 // 引入 OmniBox SDK
@@ -267,6 +267,150 @@ function convertToPlaySources(vodPlayFrom, vodPlayUrl, vodId) {
   return playSources;
 }
 
+function encodePlayMeta(meta) {
+  try {
+    return Buffer.from(JSON.stringify(meta || {}), "utf8").toString("base64");
+  } catch (error) {
+    return "";
+  }
+}
+
+function decodePlayMeta(meta) {
+  try {
+    const raw = Buffer.from(String(meta || ""), "base64").toString("utf8");
+    return JSON.parse(raw || "{}");
+  } catch (error) {
+    return {};
+  }
+}
+
+function parseVodIdForFallback(vodId) {
+  const result = {
+    title: "",
+    episodeName: "",
+  };
+
+  if (!vodId) {
+    return result;
+  }
+
+  const parts = String(vodId).split("|");
+  if (parts.length >= 2) {
+    result.title = parts[2] || parts[1] || "";
+  }
+
+  return result;
+}
+
+function normalizeEpisodeName(episodeName) {
+  if (!episodeName) {
+    return "";
+  }
+
+  let name = String(episodeName).trim();
+  name = name.replace(/^[\s\uFEFF\u200B]+/g, "");
+  name = name.replace(/^[\[\(【{]?\s*(?:uc|quark|aliyun|baidu|115|tianyi|xunlei|123|mobile)\b\s*[\]\)】}]?[\s._-]*/i, "");
+  name = name.replace(/^(?:uc|quark|aliyun|baidu|115|tianyi|xunlei|123|mobile)\b[\s._-]*/i, "");
+  return name;
+}
+
+function preprocessTitleForDanmu(title) {
+  if (!title) {
+    return "";
+  }
+  return title
+    .replace(/4[kK]|[xX]26[45]|720[pP]|1080[pP]|2160[pP]/g, " ")
+    .replace(/[hH]\.?26[45]/g, " ")
+    .replace(/BluRay|WEB-DL|HDR|REMUX/gi, " ")
+    .replace(/\.mp4|\.mkv|\.avi|\.flv/gi, " ");
+}
+
+function preprocessTitle(title) {
+  if (!title) return "";
+  return title
+    .replace(/4[kK]|[xX]26[45]|720[pP]|1080[pP]|2160[pP]|1280x720|1920x1080/g, " ")
+    .replace(/[hH]\.?26[45]/g, " ")
+    .replace(/BluRay|WEB-DL|HDR|REMUX/gi, " ")
+    .replace(/\.mp4|\.mkv|\.avi|\.flv/gi, " ");
+}
+
+function extractEpisode(title) {
+  if (!title) return "";
+
+  const processedTitle = preprocessTitle(title).trim();
+
+  const seMatch = processedTitle.match(/[Ss](?:\d{1,2})?[-._\s]*[Ee](\d{1,3})/i);
+  if (seMatch) return seMatch[1];
+
+  const cnMatch = processedTitle.match(/第\s*([零一二三四五六七八九十0-9]+)\s*[集话章节回期]/);
+  if (cnMatch) return String(chineseToArabic(cnMatch[1]));
+
+  const epMatch = processedTitle.match(/\b(?:EP|E)[-._\s]*(\d{1,3})\b/i);
+  if (epMatch) return epMatch[1];
+
+  const bracketMatch = processedTitle.match(/[\[\(【（](\d{1,3})[\]\)】）]/);
+  if (bracketMatch) {
+    const num = bracketMatch[1];
+    if (!["720", "1080", "480"].includes(num)) return num;
+  }
+
+  const standaloneMatches = processedTitle.match(/(?:^|[\s\-\._\[\]])(\d{1,3})(?![0-9pP])/g);
+  if (standaloneMatches) {
+    const candidates = standaloneMatches
+      .map((m) => m.match(/\d+/)[0])
+      .filter((num) => {
+        const n = parseInt(num, 10);
+        return n > 0 && n < 300 && !["720", "480", "264", "265"].includes(num);
+      });
+
+    if (candidates.length > 0) {
+      const normalEp = candidates.find((n) => parseInt(n, 10) < 100);
+      return normalEp || candidates[0];
+    }
+  }
+
+  return "";
+}
+
+function buildFileNameForDanmu(vodName, episodeTitle) {
+  if (!vodName) {
+    return "";
+  }
+
+  if (!episodeTitle || episodeTitle === "正片" || episodeTitle === "播放") {
+    return vodName;
+  }
+
+  const digits = extractEpisode(episodeTitle);
+  if (digits) {
+    const epNum = parseInt(digits, 10);
+    if (epNum > 0) {
+      return epNum < 10 ? `${vodName} S01E0${epNum}` : `${vodName} S01E${epNum}`;
+    }
+  }
+
+  return vodName;
+}
+
+function buildScrapedFileName(scrapeData, mapping, originalFileName) {
+  if (!mapping || mapping.episodeNumber === 0 || (mapping.confidence && mapping.confidence < 0.5)) {
+    return originalFileName;
+  }
+
+  if (scrapeData && scrapeData.episodes && Array.isArray(scrapeData.episodes)) {
+    for (const episode of scrapeData.episodes) {
+      if (episode.episodeNumber === mapping.episodeNumber && episode.seasonNumber === mapping.seasonNumber) {
+        if (episode.name) {
+          return `${episode.episodeNumber}.${episode.name}`;
+        }
+        break;
+      }
+    }
+  }
+
+  return originalFileName;
+}
+
 /**
  * 首页
  */
@@ -416,6 +560,101 @@ async function detail(params, context) {
 
     applyImageProxyToList(data.list, baseURL);
 
+    // 刮削处理
+    try {
+      const currentItem = data.list[0] || {};
+      const vodId = String(currentItem.vod_id || currentItem.VodID || videoId);
+      const vodName = String(currentItem.vod_name || currentItem.VodName || "");
+      const playSources = currentItem.vod_play_sources || [];
+
+      const filesForScraping = [];
+      for (const source of playSources) {
+        const episodes = source?.episodes || [];
+        for (const episode of episodes) {
+          const rawName = String(episode.name || episode.rawName || "");
+          const playId = String(episode.playId || "");
+          if (!playId) continue;
+          const formattedId = `${vodId}|${playId}`;
+          filesForScraping.push({
+            file_name: rawName,
+            fid: formattedId,
+            file_id: formattedId,
+          });
+        }
+      }
+
+      if (filesForScraping.length > 0) {
+        OmniBox.log("info", `开始执行刮削处理: vodId=${vodId}, files=${filesForScraping.length}`);
+        await OmniBox.processScraping(vodId, vodName, "", filesForScraping);
+      }
+    } catch (error) {
+      OmniBox.log("warn", `刮削处理失败: ${error.message}`);
+    }
+
+    // 应用刮削后的元数据
+    try {
+      const currentItem = data.list[0] || {};
+      const vodId = String(currentItem.vod_id || currentItem.VodID || videoId);
+      const metadata = await OmniBox.getDriveMetadata(vodId);
+      const scrapeData = metadata?.scrapeData || null;
+      const videoMappings = metadata?.videoMappings || [];
+
+      if (scrapeData || (videoMappings && videoMappings.length > 0)) {
+        const playSources = currentItem.vod_play_sources || [];
+        for (const source of playSources) {
+          const episodes = source?.episodes || [];
+          for (const episode of episodes) {
+            const playId = String(episode.playId || "");
+            const formattedId = `${vodId}|${playId}`;
+            let matchedMapping = null;
+            for (const mapping of videoMappings) {
+              if (mapping && mapping.fileId === formattedId) {
+                matchedMapping = mapping;
+                break;
+              }
+            }
+
+            if (matchedMapping && scrapeData) {
+              const originalName = String(episode.name || "");
+              const newName = buildScrapedFileName(scrapeData, matchedMapping, originalName);
+              if (newName && newName !== originalName) {
+                episode.name = newName;
+              }
+            }
+
+            const normalizedOriginalEpisodeName = normalizeEpisodeName(episode.rawName || episode.name || "");
+            const playMeta = encodePlayMeta({
+              t: String(currentItem.vod_name || currentItem.VodName || ""),
+              e: normalizedOriginalEpisodeName,
+            });
+            if (playMeta && playId && !String(playId).includes("|||")) {
+              episode.playId = `${playId}|||${playMeta}`;
+            }
+          }
+        }
+
+        if (scrapeData) {
+          if (scrapeData.title) {
+            currentItem.vod_name = scrapeData.title;
+          }
+          if (scrapeData.posterPath) {
+            currentItem.vod_pic = `https://image.tmdb.org/t/p/w500${scrapeData.posterPath}`;
+          }
+          if (scrapeData.releaseDate) {
+            currentItem.vod_year = scrapeData.releaseDate.substring(0, 4) || "";
+          }
+          if (scrapeData.overview) {
+            currentItem.vod_content = scrapeData.overview;
+          }
+          if (scrapeData.voteAverage) {
+            currentItem.vod_douban_score = scrapeData.voteAverage.toFixed(1);
+          }
+        }
+      }
+    } catch (error) {
+      OmniBox.log("warn", `应用刮削元数据失败: ${error.message}`);
+    }
+
     return data;
   } catch (error) {
     OmniBox.log("error", `获取视频详情失败: ${error.message}`);
@@ -435,19 +674,31 @@ async function play(params) {
       throw new Error("播放参数不能为空");
     }
 
-    OmniBox.log("info", `获取播放地址: playId=${playId}, flag=${flag}`);
+    let mainPlayId = playId;
+    let metaPart = "";
+    if (playId.includes("|||")) {
+      const splitParts = playId.split("|||");
+      mainPlayId = splitParts[0] || "";
+      metaPart = splitParts[1] || "";
+    }
+
+    const playMeta = decodePlayMeta(metaPart);
+    const originalTitle = playMeta.t || playMeta.v || playMeta.title || "";
+    const originalEpisodeName = playMeta.e || playMeta.episodeName || "";
+
+    OmniBox.log("info", `获取播放地址: playId=${mainPlayId}, flag=${flag}`);
 
     // 直接播放链接（m3u8/mp4 等）直接返回
-    if (/\.(m3u8|mp4|rmvb|avi|wmv|flv|mkv|webm|mov|m3u)(?!\w)/i.test(playId)) {
+    if (/\.(m3u8|mp4|rmvb|avi|wmv|flv|mkv|webm|mov|m3u)(?!\w)/i.test(mainPlayId)) {
       return {
-        urls: [{ name: "播放", url: playId }],
+        urls: [{ name: "播放", url: mainPlayId }],
         flag: flag,
         header: {},
         parse: 0,
       };
     }
 
-    const data = await requestXiaoya(PLAY_PATH, { id: playId });
+    const data = await requestXiaoya(PLAY_PATH, { id: mainPlayId });
 
     if (!data || !data.url) {
       throw new Error("播放接口返回为空");
@@ -456,11 +707,78 @@ async function play(params) {
     const header = typeof data.header === "string" ? JSON.parse(data.header) : data.header || {};
     const urls = buildPlayUrls(data.url);
 
+    // 弹幕匹配
+    let danmakuList = [];
+    let scrapeTitle = "";
+    let scrapePic = "";
+    try {
+      const vodId = params.vodId || "";
+      if (vodId) {
+        const metadata = await OmniBox.getDriveMetadata(vodId);
+        if (metadata && metadata.scrapeData && metadata.videoMappings) {
+          const formattedFileId = `${vodId}|${mainPlayId}`;
+          let matchedMapping = null;
+          for (const mapping of metadata.videoMappings) {
+            if (mapping.fileId === formattedFileId) {
+              matchedMapping = mapping;
+              break;
+            }
+          }
+
+          if (metadata.scrapeData) {
+            scrapeTitle = metadata.scrapeData.title || "";
+            if (metadata.scrapeData.posterPath) {
+              scrapePic = `https://image.tmdb.org/t/p/w500${metadata.scrapeData.posterPath}`;
+            }
+          }
+
+          if (matchedMapping && metadata.scrapeData) {
+            const scrapeData = metadata.scrapeData;
+            let fileName = "";
+            const scrapeType = metadata.scrapeType || "";
+            if (scrapeType === "movie") {
+              fileName = scrapeData.title || "";
+            } else {
+              const title = scrapeData.title || "";
+              const seasonAirYear = scrapeData.seasonAirYear || "";
+              const seasonNumber = matchedMapping.seasonNumber || 1;
+              const epNum = matchedMapping.episodeNumber || 1;
+              fileName = `${title}.${seasonAirYear}.S${String(seasonNumber).padStart(2, "0")}E${String(epNum).padStart(2, "0")}`;
+            }
+
+            if (fileName) {
+              OmniBox.log("info", `生成fileName用于弹幕匹配: ${fileName}`);
+              danmakuList = await OmniBox.getDanmakuByFileName(fileName);
+            }
+          }
+        }
+      }
+    } catch (error) {
+      OmniBox.log("warn", `弹幕匹配失败: ${error.message}`);
+    }
+
+    if (!danmakuList || danmakuList.length === 0) {
+      const fallbackFromVodId = parseVodIdForFallback(params.vodId || "");
+      const rawFallbackEpisodeName = originalEpisodeName || params.episodeName || fallbackFromVodId.episodeName || "";
+      const fallbackEpisodeName = normalizeEpisodeName(rawFallbackEpisodeName);
+      const fallbackTitle = originalTitle || params.title || scrapeTitle || fallbackFromVodId.title || "";
+      const fallbackFileName = buildFileNameForDanmu(fallbackTitle, fallbackEpisodeName) || fallbackTitle || fallbackEpisodeName;
+      if (fallbackFileName) {
+        try {
+          OmniBox.log("info", `使用兜底文件名进行弹幕匹配: ${fallbackFileName}`);
+          danmakuList = await OmniBox.getDanmakuByFileName(fallbackFileName);
+        } catch (error) {
+          OmniBox.log("warn", `兜底弹幕匹配失败: ${error.message}`);
+        }
+      }
+    }
+
     return {
       urls,
       flag: flag,
       header,
       parse: 0,
+      danmaku: danmakuList,
     };
   } catch (error) {
     OmniBox.log("error", `播放接口失败: ${error.message}`);
@@ -468,6 +786,7 @@ async function play(params) {
       urls: [],
       flag: params.flag || "",
       header: {},
+      danmaku: [],
     };
   }
 }
