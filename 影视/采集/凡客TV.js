@@ -2,7 +2,7 @@
 // @author 梦
 // @description 刮削：已接入，弹幕：未接入，嗅探：按官方 POST 播放接口直链优先（失败时页面回退）；已补首页推荐与关键词搜索
 // @dependencies cheerio
-// @version 1.3.0
+// @version 1.3.1
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/采集/凡客TV.js
 
 const OmniBox = require("omnibox_sdk");

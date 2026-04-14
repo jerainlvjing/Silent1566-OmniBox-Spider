@@ -1,7 +1,7 @@
 // @name 嗷呜动漫
 // @author 
 // @description 刮削：支持，弹幕：支持，嗅探：支持
-// @version 1.0.3
+// @version 1.0.4
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/动漫/嗷呜动漫.js
 /**
 * ============================================================================

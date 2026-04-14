@@ -1,7 +1,7 @@
 // @name 盘搜分组
 // @author 
 // @description 刮削：支持，弹幕：支持，嗅探：支持，只支持tvbox接口
-// @version 1.1.2
+// @version 1.1.6
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/网盘/盘搜分组.js
 
 /**
@@ -31,7 +31,7 @@ const PANSOU_CLOUD_TYPES = process.env.PANSOU_CLOUD_TYPES || "";
 const PANSOU_FILTER = process.env.PANSOU_FILTER || { "include": [""], "exclude": [] };
 const PANCHECK_API = process.env.PANCHECK_API || "";
 const PANCHECK_ENABLED = true;
-const PANCHECK_PLATFORMS = process.env.PANCHECK_PLATFORMS || "";
+const PANCHECK_PLATFORMS = process.env.PANCHECK_PLATFORMS || "quark,baidu,uc,pan123,tianyi,cmcc";
 
 // 网盘类型匹配配置: 使用分号分隔，例如 quark;uc
 const DRIVE_TYPE_CONFIG = (process.env.DRIVE_TYPE_CONFIG || "quark;uc").split(';').map((t) => t.trim()).filter(Boolean);
@@ -53,22 +53,39 @@ function inferDriveTypeFromSourceName(name = "") {
     if (raw === "uc" || raw.includes("uc")) return "uc";
     if (raw.includes("115")) return "115";
     if (raw.includes("迅雷")) return "xunlei";
-    if (raw.includes("阿里")) return "ali";
-    if (raw.includes("123")) return "123pan";
+    if (raw.includes("阿里")) return "aliyun";
+    if (raw.includes("移动") || raw.includes("139") || raw.includes("cmcc")) return "cmcc";
+    if (raw.includes("123")) return "pan123";
     return raw;
 }
 
 function normalizeDriveType(driveType = "") {
     const raw = String(driveType || "").toLowerCase();
-    if (raw.includes("aliyun") || raw.includes("ali") || raw.includes("阿里")) return "ali";
+    if (raw.includes("aliyun") || raw === "ali" || raw.includes("阿里")) return "aliyun";
     if (raw.includes("baidu") || raw.includes("百度")) return "baidu";
     if (raw.includes("tianyi") || raw.includes("天翼")) return "tianyi";
     if (raw.includes("quark") || raw.includes("夸克")) return "quark";
     if (raw === "uc" || raw.includes("uc")) return "uc";
     if (raw.includes("115")) return "115";
     if (raw.includes("xunlei") || raw.includes("迅雷")) return "xunlei";
-    if (raw.includes("123pan") || raw === "123" || raw.includes("123")) return "123pan";
+    if (raw.includes("cmcc") || raw.includes("mobile") || raw.includes("139") || raw.includes("移动")) return "cmcc";
+    if (raw.includes("pan123") || raw === "123" || raw.includes("123")) return "pan123";
     return raw;
+}
+
+function inferDriveTypeFromShareURL(shareURL = "") {
+    const raw = String(shareURL || "").toLowerCase();
+    if (!raw) return "";
+    if (raw.includes("pan.quark.cn") || raw.includes("drive.quark.cn")) return "quark";
+    if (raw.includes("drive.uc.cn") || raw.includes("fast.uc.cn")) return "uc";
+    if (raw.includes("pan.baidu.com")) return "baidu";
+    if (raw.includes("cloud.189.cn")) return "tianyi";
+    if (raw.includes("yun.139.com")) return "cmcc";
+    if (raw.includes("www.aliyundrive.com") || raw.includes("www.alipan.com") || raw.includes("aliyundrive.com") || raw.includes("alipan.com")) return "aliyun";
+    if (raw.includes("pan.xunlei.com")) return "xunlei";
+    if (raw.includes("115.com")) return "115";
+    if (raw.includes("123684.com") || raw.includes("123865.com") || raw.includes("123912.com") || raw.includes("123pan.com")) return "pan123";
+    return "";
 }
 
 function sortPlaySourcesByDriveOrder(playSources = []) {
@@ -268,23 +285,92 @@ async function requestPansouAPI(params = {}) {
 /**
 * 调用 PanCheck API 检测链接有效性
 */
+function getPanCheckSelectedPlatforms() {
+    return String(PANCHECK_PLATFORMS || "")
+        .split(",")
+        .map((p) => normalizeDriveType(p.trim()))
+        .filter(Boolean);
+}
+
+function splitLinksByPanCheckPlatforms(links = []) {
+    const allLinks = Array.isArray(links) ? links.filter(Boolean) : [];
+    const selectedPlatforms = getPanCheckSelectedPlatforms();
+
+    if (selectedPlatforms.length === 0) {
+        return {
+            selectedPlatforms: [],
+            linksToCheck: allLinks,
+            bypassLinks: [],
+        };
+    }
+
+    const selectedPlatformSet = new Set(selectedPlatforms);
+    const linksToCheck = [];
+    const bypassLinks = [];
+
+    for (const link of allLinks) {
+        const inferredByUrl = inferDriveTypeFromShareURL(link);
+        const inferredBySdk = normalizeDriveType(OmniBox.getDriveInfoByShareURL(link)?.driveType || "");
+        const driveType = inferredByUrl || inferredBySdk;
+        if (selectedPlatformSet.has(driveType)) {
+            linksToCheck.push(link);
+        } else {
+            bypassLinks.push(link);
+        }
+    }
+
+    return {
+        selectedPlatforms,
+        linksToCheck,
+        bypassLinks,
+    };
+}
+
 async function checkLinksWithPanCheck(links) {
     if (!PANCHECK_ENABLED || !PANCHECK_API || links.length === 0) {
-        return new Set();
+        return {
+            invalidLinksSet: new Set(),
+            stats: null,
+        };
     }
 
     try {
-        OmniBox.log("info", `开始调用 PanCheck 检测链接,链接数量: ${links.length}`);
+        const { selectedPlatforms, linksToCheck, bypassLinks } = splitLinksByPanCheckPlatforms(links);
+        const detectDriveType = (link) => inferDriveTypeFromShareURL(link) || normalizeDriveType(OmniBox.getDriveInfoByShareURL(link)?.driveType || "") || "unknown";
+        const inputPlatformStats = {};
 
-        const requestBody = { links: links };
+        for (const link of links) {
+            const driveType = detectDriveType(link);
+            inputPlatformStats[driveType] = (inputPlatformStats[driveType] || 0) + 1;
+        }
 
-        if (PANCHECK_PLATFORMS) {
-            const platforms = PANCHECK_PLATFORMS.split(",")
-                .map((p) => p.trim())
-                .filter((p) => p);
-            if (platforms.length > 0) {
-                requestBody.selected_platforms = platforms;
-            }
+        if (linksToCheck.length === 0) {
+            OmniBox.log("info", `PanCheck 跳过: 未命中待校验平台, 跳过链接数量: ${bypassLinks.length}`);
+            return {
+                invalidLinksSet: new Set(),
+                stats: {
+                    selectedPlatforms,
+                    inputPlatformStats,
+                    checkedPlatformStats: {},
+                    invalidPlatformStats: {},
+                    validPlatformStats: {},
+                    bypassPlatformStats: inputPlatformStats,
+                    totalInput: links.length,
+                    totalChecked: 0,
+                    totalInvalid: 0,
+                    totalValid: 0,
+                    totalBypass: bypassLinks.length,
+                    totalOutput: links.length,
+                },
+            };
+        }
+
+        OmniBox.log("info", `开始调用 PanCheck 检测链接, 总链接: ${links.length}, 待校验: ${linksToCheck.length}, 跳过: ${bypassLinks.length}, 平台: ${selectedPlatforms.join(",") || "全部"}`);
+
+        const requestBody = { links: linksToCheck };
+
+        if (selectedPlatforms.length > 0) {
+            requestBody.selected_platforms = selectedPlatforms;
         }
 
         const apiUrl = PANCHECK_API.replace(/\/$/, "");
@@ -301,19 +387,61 @@ async function checkLinksWithPanCheck(links) {
 
         if (response.statusCode !== 200) {
             OmniBox.log("warn", `PanCheck API 响应错误: ${response.statusCode}`);
-            return new Set();
+            return {
+                invalidLinksSet: new Set(),
+                stats: null,
+            };
         }
 
         const data = JSON.parse(response.body);
         const invalidLinks = data.invalid_links || [];
         const validLinks = data.valid_links || [];
+        const invalidLinksSet = new Set(invalidLinks);
+        const checkedPlatformStats = {};
+        const invalidPlatformStats = {};
+        const validPlatformStats = {};
+        const bypassPlatformStats = {};
 
-        OmniBox.log("info", `PanCheck 检测完成,有效链接: ${validLinks.length}, 无效链接: ${invalidLinks.length}`);
+        for (const link of linksToCheck) {
+            const driveType = detectDriveType(link);
+            checkedPlatformStats[driveType] = (checkedPlatformStats[driveType] || 0) + 1;
+            if (invalidLinksSet.has(link)) {
+                invalidPlatformStats[driveType] = (invalidPlatformStats[driveType] || 0) + 1;
+            } else {
+                validPlatformStats[driveType] = (validPlatformStats[driveType] || 0) + 1;
+            }
+        }
 
-        return new Set(invalidLinks);
+        for (const link of bypassLinks) {
+            const driveType = detectDriveType(link);
+            bypassPlatformStats[driveType] = (bypassPlatformStats[driveType] || 0) + 1;
+        }
+
+        OmniBox.log("info", `PanCheck 检测完成,有效链接: ${validLinks.length}, 无效链接: ${invalidLinks.length}, 未校验直出: ${bypassLinks.length}`);
+
+        return {
+            invalidLinksSet,
+            stats: {
+                selectedPlatforms,
+                inputPlatformStats,
+                checkedPlatformStats,
+                invalidPlatformStats,
+                validPlatformStats,
+                bypassPlatformStats,
+                totalInput: links.length,
+                totalChecked: linksToCheck.length,
+                totalInvalid: invalidLinks.length,
+                totalValid: validLinks.length,
+                totalBypass: bypassLinks.length,
+                totalOutput: (links.length - invalidLinks.length),
+            },
+        };
     } catch (error) {
         OmniBox.log("warn", `PanCheck 链接检测失败: ${error.message}`);
-        return new Set();
+        return {
+            invalidLinksSet: new Set(),
+            stats: null,
+        };
     }
 }
 
@@ -785,8 +913,12 @@ async function searchSpecificPan(keyword, page, panType) {
         let validLinksSet = new Set(links);
         if (PANCHECK_ENABLED && PANCHECK_API && links.length > 0) {
             try {
-                const invalidLinksSet = await checkLinksWithPanCheck(links);
+                const { invalidLinksSet, stats } = await checkLinksWithPanCheck(links);
                 validLinksSet = new Set(links.filter(link => !invalidLinksSet.has(link)));
+                if (stats) {
+                    OmniBox.log("info", `PanCheck 分平台统计(${panType}): 输入=${JSON.stringify(stats.inputPlatformStats)}, 校验=${JSON.stringify(stats.checkedPlatformStats)}, 过滤=${JSON.stringify(stats.invalidPlatformStats)}, 剩余=${JSON.stringify(stats.validPlatformStats)}, 跳过=${JSON.stringify(stats.bypassPlatformStats)}`);
+                    OmniBox.log("info", `PanCheck 总统计(${panType}): 总输入=${stats.totalInput}, 总校验=${stats.totalChecked}, 总过滤=${stats.totalInvalid}, 总剩余=${stats.totalOutput}, 其中直出=${stats.totalBypass}`);
+                }
                 OmniBox.log("info", `链接检测完成,有效链接: ${validLinksSet.size}, 无效链接: ${invalidLinksSet.size}`);
             } catch (error) {
                 OmniBox.log("warn", `PanCheck 处理失败: ${error.message}`);
@@ -856,8 +988,12 @@ async function search(params) {
         let validLinksSet = new Set(links);
         if (PANCHECK_ENABLED && PANCHECK_API && links.length > 0) {
             try {
-                const invalidLinksSet = await checkLinksWithPanCheck(links);
+                const { invalidLinksSet, stats } = await checkLinksWithPanCheck(links);
                 validLinksSet = new Set(links.filter(link => !invalidLinksSet.has(link)));
+                if (stats) {
+                    OmniBox.log("info", `PanCheck 分平台统计(分组搜索): 输入=${JSON.stringify(stats.inputPlatformStats)}, 校验=${JSON.stringify(stats.checkedPlatformStats)}, 过滤=${JSON.stringify(stats.invalidPlatformStats)}, 剩余=${JSON.stringify(stats.validPlatformStats)}, 跳过=${JSON.stringify(stats.bypassPlatformStats)}`);
+                    OmniBox.log("info", `PanCheck 总统计(分组搜索): 总输入=${stats.totalInput}, 总校验=${stats.totalChecked}, 总过滤=${stats.totalInvalid}, 总剩余=${stats.totalOutput}, 其中直出=${stats.totalBypass}`);
+                }
                 OmniBox.log("info", `链接检测完成,有效链接: ${validLinksSet.size}, 无效链接: ${invalidLinksSet.size}`);
             } catch (error) {
                 OmniBox.log("warn", `PanCheck 处理失败: ${error.message}`);
@@ -1322,7 +1458,7 @@ async function play(params) {
                 const title = params.title || scrapeTitle || shareURL;
                 const pic = params.pic || scrapePic || "";
 
-                const added = await OmniBox.addPlayHistory({
+                Promise.resolve(OmniBox.addPlayHistory({
                     vodId: vodId,
                     title: title,
                     pic: pic,
@@ -1330,11 +1466,17 @@ async function play(params) {
                     sourceId: shareURL,
                     episodeNumber: episodeNumber,
                     episodeName: episodeName,
-                });
-
-                if (added) {
-                    OmniBox.log("info", `已添加观看记录: ${title}`);
-                }
+                }))
+                    .then((added) => {
+                        if (added) {
+                            OmniBox.log("info", `已添加观看记录: ${title}`);
+                        } else {
+                            OmniBox.log("info", `观看记录未写入(返回 falsy): ${title}`);
+                        }
+                    })
+                    .catch((error) => {
+                        OmniBox.log("warn", `添加观看记录失败: ${error.message}`);
+                    });
             }
         } catch (error) {
             OmniBox.log("warn", `添加观看记录失败: ${error.message}`);
