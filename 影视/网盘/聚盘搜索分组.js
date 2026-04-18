@@ -798,6 +798,10 @@ async function category(params, context) {
   if (decodedCategoryMeta?.mode === "rank_folder") {
     const keyword = text(decodedCategoryMeta.keyword || decodedCategoryMeta.title || "");
     await OmniBox.log("info", `[category] rank_folder 分组列表 keyword=${keyword}, page=${page}`);
+    if (page > 1) {
+      await OmniBox.log("info", `[category] rank_folder 超出第一页，返回空列表 keyword=${keyword}, page=${page}`);
+      return { page, pagecount: 1, total: 0, list: [] };
+    }
     if (!keyword) return { page, pagecount: 0, total: 0, list: [] };
 
     let items = await searchAndFilterItems(keyword);
@@ -835,6 +839,10 @@ async function category(params, context) {
     const driveType = normalizeDriveType(decodedCategoryMeta.driveType || "", "");
     const keyword = text(decodedCategoryMeta.keyword || decodedCategoryMeta.title || "");
     await OmniBox.log("info", `[category] group_drive_folder 分享列表 drive=${driveType}, keyword=${keyword}, page=${page}`);
+    if (page > 1) {
+      await OmniBox.log("info", `[category] group_drive_folder 超出第一页，返回空列表 drive=${driveType}, keyword=${keyword}, page=${page}`);
+      return { page, pagecount: 1, total: 0, list: [] };
+    }
     if (!keyword || !driveType) return { page, pagecount: 0, total: 0, list: [] };
 
     let cachedDriveList = await getCachedJSON(buildCacheKey("jupan-group:drive-list", `${keyword}::${driveType}`));
