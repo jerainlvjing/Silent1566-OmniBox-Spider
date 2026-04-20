@@ -2,7 +2,7 @@
 // @author lampon
 // @description
 // @dependencies axios
-// @version 1.1.2
+// @version 1.1.5
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/网盘/影巢.js
 
 const OmniBox = require("omnibox_sdk");
@@ -1920,7 +1920,7 @@ async function play(params, context) {
     let episodeNumber = null;
     let episodeName = safeString(params?.episodeName || "");
     try {
-      const resourceId = `spider_source_${safeString(context?.sourceId || "")}_${shareURL}`;
+      const resourceId = safeString(rawVodIdFromPlayId || params?.vodId || "");
       const metadata = await OmniBox.getScrapeMetadata(resourceId);
       if (metadata && metadata.scrapeData && metadata.videoMappings) {
         const formattedFileId = `${shareURL}|${fileId}`;
@@ -1950,9 +1950,17 @@ async function play(params, context) {
             fileName = `${title}.${seasonAirYear}.S${String(seasonNumber).padStart(2, "0")}E${String(epNum).padStart(2, "0")}`;
           }
           if (fileName) {
+            await OmniBox.log("info", `tmdb.js play 弹幕匹配 fileName=${fileName}`);
             danmakuList = await OmniBox.getDanmakuByFileName(fileName);
+            await OmniBox.log("info", `tmdb.js play 弹幕匹配结果 count=${Array.isArray(danmakuList) ? danmakuList.length : 0}`);
+          } else {
+            await OmniBox.log("info", `tmdb.js play 弹幕匹配跳过: fileName 为空, shareURL=${shareURL}`);
           }
+        } else {
+          await OmniBox.log("info", `tmdb.js play 弹幕匹配未命中 mapping: fileId=${formattedFileId}`);
         }
+      } else {
+        await OmniBox.log("info", `tmdb.js play 弹幕匹配跳过: metadata 不完整`);
       }
     } catch (error) {
       await OmniBox.log(
@@ -1990,14 +1998,13 @@ async function play(params, context) {
       }))
       .filter((x) => x.url);
 
-    // 插入播放记录（参考 pansou.js）
+    // 播放记录：不阻塞主流程，放到后台回调里执行并打印结果日志
     try {
-      // 优先使用 playId 第三段透传的 vodId，其次 params.vodId，最后回退 shareURL
       const vodId = safeString(rawVodIdFromPlayId || params?.vodId || shareURL);
       const title = safeString(params?.title || scrapeTitle || shareURL);
       const pic = safeString(params?.pic || scrapePic || "");
       const firstUrl = urls[0]?.url || "";
-      await OmniBox.addPlayHistory({
+      Promise.resolve(OmniBox.addPlayHistory({
         vodId,
         title,
         pic,
@@ -2006,11 +2013,23 @@ async function play(params, context) {
         episodeName: episodeName,
         playUrl: firstUrl,
         playHeader: playInfo.header || {},
-      });
+      }))
+        .then((added) => {
+          OmniBox.log(
+            "info",
+            `tmdb.js play 写入播放记录完成: vodId=${vodId}, episodeName=${episodeName || ""}, added=${String(added)}`,
+          );
+        })
+        .catch((error) => {
+          OmniBox.log(
+            "warn",
+            `tmdb.js play 写入播放记录失败: ${error.message}`,
+          );
+        });
     } catch (error) {
       await OmniBox.log(
         "warn",
-        `tmdb.js play 写入播放记录失败: ${error.message}`,
+        `tmdb.js play 构造播放记录任务失败: ${error.message}`,
       );
     }
 
