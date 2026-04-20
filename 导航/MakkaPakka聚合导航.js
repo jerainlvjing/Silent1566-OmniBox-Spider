@@ -1,7 +1,8 @@
 // @name MakkaPakka聚合导航
 // @author 梦
 // @description 基于 AstrBot Widget 通用桥接的 OmniBox 导航源，动态读取远端 Widget Metadata 与模块函数
-// @version 1.0.0
+// @indexs 1
+// @version 1.0.3
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/综合/导航/MakkaPakka聚合导航.js
 
 const OmniBox = require("omnibox_sdk");
@@ -77,13 +78,17 @@ async function home(params, context) {
       filters[categoryId] = filterList;
     }
 
-    const list = [];
-    if (modules.length > 0) {
-      const firstCategoryId = modules[0].functionName;
-      const firstModule = modules[0];
-      const initialParams = buildModuleParams(firstModule, 1, {});
-      const items = await callWidgetModule(widget, firstCategoryId, initialParams);
-      list.push(...mapWidgetItemsToOmniBox(items, firstCategoryId, firstModule, context));
+    let list = [];
+    for (const mod of modules) {
+      const categoryId = mod.functionName;
+      const initialParams = buildModuleParams(mod, 1, {});
+      const items = await callWidgetModule(widget, categoryId, initialParams);
+      const mapped = mapWidgetItemsToOmniBox(items, categoryId, mod, context);
+      await safeLog("info", `Makka导航 home 模块尝试: ${categoryId} raw=${Array.isArray(items) ? items.length : 0} mapped=${mapped.length}`);
+      if (mapped.length > 0) {
+        list = mapped;
+        break;
+      }
     }
 
     return {
@@ -127,7 +132,7 @@ async function category(params, context) {
           buildTextVod({
             title: "未找到对应栏目",
             description: `categoryId=${categoryId}`,
-            typeName: "提示",
+            typeName: "提示"
           }),
         ],
       };
@@ -416,6 +421,7 @@ function mapSingleItem(item, index, typeName, context) {
   }
 
   return {
+    // 豆瓣推荐的兼容做法：保留原始 id / tmdbId，只通过 search: true 提示宿主走搜索。
     vod_id: String(item.tmdbId || item.id || `${typeName}_${index + 1}`),
     vod_name: title,
     vod_pic: posterPath,
@@ -488,5 +494,5 @@ function simpleHash(input) {
 async function safeLog(level, message) {
   try {
     await OmniBox.log(level, message);
-  } catch (_) {}
+  } catch (_) { }
 }
