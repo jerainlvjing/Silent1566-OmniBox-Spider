@@ -2,7 +2,7 @@
 // @author 
 // @description 刮削：支持，弹幕：支持，嗅探：支持
 // @dependencies: axios, cheerio, crypto-js
-// @version 1.0.20
+// @version 1.0.21
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/采集/修罗影视.js
 
 /**
@@ -227,15 +227,73 @@ const resolveExternalOcrCandidates = () => {
     return [...new Set(candidates.filter(Boolean))];
 };
 
-const hasVerifyOperator = (raw) => /[+\-xX×/]/.test(String(raw || ""));
+const hasVerifyOperator = (raw) => /[+\-xX×*/]/.test(String(raw || ""));
+
+const normalizeVerifyText = (text) => String(text || "")
+    .replace(/\s/g, "")
+    .replace(/[=？?]+$/g, "")
+    .replace(/[xX×]/g, "*")
+    .replace(/[÷／]/g, "/")
+    .replace(/[－﹣—–]/g, "-")
+    .replace(/[十]/g, "+")
+    .replace(/[oO。]/g, "0");
+
+const shrinkNegativeSubtraction = (left, right) => {
+    let currentRight = String(right || "");
+    const leftNum = parseInt(left, 10);
+    if (Number.isNaN(leftNum) || !currentRight) return null;
+
+    while (currentRight.length > 0) {
+        const rightNum = parseInt(currentRight, 10);
+        if (!Number.isNaN(rightNum) && leftNum - rightNum >= 0) {
+            return `${left}-${currentRight}`;
+        }
+        currentRight = currentRight.slice(0, -1);
+    }
+
+    return null;
+};
+
+const normalizeVerifyExpression = (text) => {
+    let exp = normalizeVerifyText(text);
+    if (!exp) return "";
+
+    exp = exp.replace(/-7$/g, "");
+
+    const firstExprMatch = exp.match(/^(\d+)([\+\-\*\/])(\d+)/);
+    if (!firstExprMatch) return exp;
+
+    const left = firstExprMatch[1];
+    const op = firstExprMatch[2];
+    let right = firstExprMatch[3];
+
+    if (right.endsWith("7") && right.length > 1) {
+        right = right.slice(0, -1);
+    }
+    if (right.length > 2) {
+        right = right.slice(0, 2);
+    }
+    if (op === "-") {
+        const nonNegativeExpr = shrinkNegativeSubtraction(left, right);
+        if (nonNegativeExpr) return nonNegativeExpr;
+    }
+
+    return `${left}${op}${right}`;
+};
 
 const normalizePureDigitsVerifyExpr = (raw) => {
-    const digits = String(raw || "").replace(/\D/g, "");
+    let digits = normalizeVerifyText(raw).replace(/\D/g, "");
+    if (!digits) return "";
+
+    if (digits.length >= 3 && digits.endsWith("7")) {
+        digits = digits.slice(0, -1);
+    }
+
     if (digits.length === 4) {
-        return `${digits.slice(0, 2)}-${digits.slice(2)}`;
+        return shrinkNegativeSubtraction(digits.slice(0, 2), digits.slice(2)) || `${digits.slice(0, 2)}-${digits.slice(2)}`;
     }
     if (digits.length === 5) {
-        return `${digits.slice(0, 2)}-${digits.slice(3)}`;
+        return shrinkNegativeSubtraction(digits.slice(0, 2), digits.slice(-2)) || `${digits.slice(0, 2)}-${digits.slice(-2)}`;
     }
     return "";
 };
@@ -259,8 +317,9 @@ const requestVerifyCodeByDefaultApi = async (b64) => {
             || data?.ocr_text
             || ""
         ).trim();
+        const normalizedRaw = normalizeVerifyExpression(raw);
         logInfo("🧾 OCR识别", { url: DEFAULT_OCR_API, raw });
-        return raw;
+        return normalizedRaw || raw;
     } catch (e) {
         logError(`⚠ OCR异常 @ ${DEFAULT_OCR_API}`, e);
         return "";
@@ -297,9 +356,10 @@ const requestVerifyCodeByOcr = async (b64) => {
                 || data?.ocr_text
                 || ""
             ).trim().split("=")[0].trim();
+            const normalizedRaw = normalizeVerifyExpression(raw);
             logInfo("🧾 OCR识别", { url, raw });
             if (!raw) continue;
-            if (hasVerifyOperator(raw)) return raw;
+            if (hasVerifyOperator(normalizedRaw)) return normalizedRaw;
             const normalizedExpr = normalizePureDigitsVerifyExpr(raw);
             if (normalizedExpr) {
                 logInfo("🧮 纯数字验证码改写", { raw, normalizedExpr });
@@ -465,13 +525,15 @@ const filters = {
 // ========== 验证码计算 ==========
 const calcVerifyCode = (text) => {
     if (!text) return null;
-    let exp = text.replace(/\s/g, "").replace("=", "");
-    exp = exp.replace(/[xX×]/g, "*").replace(/-/g, "-");
+
+    const exp = normalizeVerifyExpression(text);
     const match = exp.match(/^(\d+)([\+\-\*\/])(\d+)$/);
     if (!match) return null;
+
     const a = parseInt(match[1], 10);
     const op = match[2];
     const b = parseInt(match[3], 10);
+
     switch (op) {
         case "+":
             return a + b;
@@ -1089,7 +1151,7 @@ async function parseSearch(html, pg, keyword = "") {
     }
 
     logInfo(`📄 分页识别: 当前=${pg} 最大=${pagecount}`);
-    return { list, page: pg, pagecount, total: pagecount };
+    return { list, page: pg, pagecount, total: list.length };
 }
 
 async function play(params) {
