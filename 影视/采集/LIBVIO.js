@@ -2,7 +2,7 @@
 // @author 梦
 // @description 刮削：未接入，弹幕：未接入，嗅探：不需要（直链优先，支持网盘线路展开）
 // @dependencies
-// @version 1.3.6
+// @version 1.3.7
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/采集/LIBVIO.js
 
 const http = require("http");
@@ -907,16 +907,36 @@ async function play(params, context) {
         }
 
         const iframeUrl = buildProviderIframeUrl(player);
-        logInfo("play 使用嗅探兜底", { playPageUrl, from: player.from, decodedUrl: realUrl, encrypt: player.encrypt, rawUrl: player.url, iframeUrl });
+        const sniffTarget = iframeUrl || playPageUrl;
+        const sniffHeaders = {
+            Referer: `${getCurrentHost()}/`,
+            Origin: getCurrentHost(),
+            "User-Agent": UA
+        };
+        try {
+            const sniffResult = await OmniBox.sniffVideo(sniffTarget, sniffHeaders);
+            const sniffUrls = Array.isArray(sniffResult?.urls) ? sniffResult.urls.filter((item) => item?.url) : [];
+            if (sniffUrls.length) {
+                logInfo("play SDK嗅探完成", { playPageUrl, from: player.from, sniffTarget, sniffCount: sniffUrls.length, first: sniffUrls[0] || null });
+                return {
+                    parse: 0,
+                    flag: playFlag,
+                    header: sniffResult?.header || sniffHeaders,
+                    urls: sniffUrls.map((item) => ({ name: item.name || meta.name || "播放", url: item.url })),
+                    danmaku: sniffResult?.danmaku || []
+                };
+            }
+            logInfo("play SDK嗅探无结果", { playPageUrl, from: player.from, sniffTarget, sniffResult: sniffResult || null });
+        } catch (sniffError) {
+            logInfo("play SDK嗅探失败", { playPageUrl, from: player.from, sniffTarget, error: sniffError.message });
+        }
+
+        logInfo("play 使用嗅探兜底", { playPageUrl, from: player.from, decodedUrl: realUrl, encrypt: player.encrypt, rawUrl: player.url, iframeUrl, sniffTarget });
         return {
             parse: 1,
             flag: playFlag,
-            header: {
-                Referer: `${getCurrentHost()}/`,
-                Origin: getCurrentHost(),
-                "User-Agent": UA
-            },
-            urls: [{ name: meta.name || "播放", url: iframeUrl || playPageUrl }]
+            header: sniffHeaders,
+            urls: [{ name: meta.name || "播放", url: sniffTarget }]
         };
     } catch (error) {
         logError("play 失败", error);
