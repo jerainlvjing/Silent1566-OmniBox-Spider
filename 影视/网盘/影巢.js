@@ -2,7 +2,7 @@
 // @author lampon
 // @description
 // @dependencies axios
-// @version 1.1.12
+// @version 1.1.13
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/网盘/影巢.js
 
 const OmniBox = require("omnibox_sdk");
@@ -41,7 +41,9 @@ const TMDB_IMAGE_POSTER_SIZE = process.env.TMDB_IMAGE_POSTER_SIZE || "w500"; // 
 const HDHIVE_API_BASE_URL =
   process.env.HDHIVE_API_BASE_URL || "https://hdhive.com/api/open";
 const HDHIVE_API_KEY = process.env.HDHIVE_API_KEY || "";
-// 可选：HDHive 请求代理地址（示例：http://127.0.0.1:7890）
+// 公共上游 HTTP 代理（可选，TMDB / HDHive 共用；示例：http://127.0.0.1:7890）
+const UPSTREAM_HTTP_PROXY_URL = process.env.UPSTREAM_HTTP_PROXY_URL || process.env.HTTP_PROXY_URL || "";
+// 兼容旧变量：若未配置公共代理，则 HDHive 仍可单独使用旧的 HDHIVE_PROXY_URL
 const HDHIVE_PROXY_URL = process.env.HDHIVE_PROXY_URL || "";
 // PanCheck 配置（可选）
 const PANCHECK_API = process.env.PANCHECK_API || "";
@@ -319,6 +321,39 @@ function buildLanguageNames(scrapeData, limit = 3) {
     .filter(Boolean)
     .slice(0, limit)
     .join("/");
+}
+
+function getSharedProxyUrl() {
+  return safeString(UPSTREAM_HTTP_PROXY_URL || HDHIVE_PROXY_URL).trim();
+}
+
+function buildAxiosProxyConfig(proxyUrl, logLabel = "上游") {
+  const raw = safeString(proxyUrl).trim();
+  if (!raw) {
+    return { proxy: false, normalized: "" };
+  }
+  try {
+    const parsedUrl = new URL(raw);
+    const proxy = {
+      protocol: parsedUrl.protocol.replace(":", ""),
+      host: parsedUrl.hostname,
+      port: parsedUrl.port
+        ? Number(parsedUrl.port)
+        : parsedUrl.protocol === "https:"
+          ? 443
+          : 80,
+    };
+    if (parsedUrl.username || parsedUrl.password) {
+      proxy.auth = {
+        username: decodeURIComponent(parsedUrl.username || ""),
+        password: decodeURIComponent(parsedUrl.password || ""),
+      };
+    }
+    const normalized = `${parsedUrl.protocol}//${parsedUrl.hostname}:${proxy.port}`;
+    return { proxy, normalized };
+  } catch (error) {
+    throw new Error(`${logLabel}代理地址无效: ${error.message}`);
+  }
 }
 
 function pickScrapeDetailFields(payload = {}, scrapeData = {}, fallback = {}) {
@@ -1108,30 +1143,26 @@ async function requestHDHive(path, method = "GET", bodyObj = null) {
   if (method === "POST") headers["Content-Type"] = "application/json";
 
   await OmniBox.log("info", `HDHive 请求: ${method} ${path}`);
+  const sharedProxyUrl = getSharedProxyUrl();
+  const proxySource = safeString(UPSTREAM_HTTP_PROXY_URL).trim()
+    ? "UPSTREAM_HTTP_PROXY_URL"
+    : safeString(HDHIVE_PROXY_URL).trim()
+      ? "HDHIVE_PROXY_URL"
+      : "";
   // axios 代理配置（可选）
   let proxyConfig = false;
-  if (HDHIVE_PROXY_URL) {
+  if (sharedProxyUrl) {
     try {
-      const p = new URL(HDHIVE_PROXY_URL);
-      proxyConfig = {
-        protocol: p.protocol.replace(":", ""),
-        host: p.hostname,
-        port: p.port ? Number(p.port) : p.protocol === "https:" ? 443 : 80,
-      };
-      if (p.username || p.password) {
-        proxyConfig.auth = {
-          username: decodeURIComponent(p.username || ""),
-          password: decodeURIComponent(p.password || ""),
-        };
-      }
+      const parsedProxy = buildAxiosProxyConfig(sharedProxyUrl, "HDHive");
+      proxyConfig = parsedProxy.proxy;
       await OmniBox.log(
         "info",
-        `HDHive 启用代理: ${p.protocol}//${p.hostname}:${proxyConfig.port}`,
+        `HDHive 启用代理: ${parsedProxy.normalized}${proxySource ? ` source=${proxySource}` : ""}`,
       );
     } catch (e) {
       await OmniBox.log(
         "warn",
-        `HDHIVE_PROXY_URL 无效，忽略代理: ${e.message}`,
+        `${proxySource || "代理"} 无效，忽略代理: ${e.message}`,
       );
       proxyConfig = false;
     }
@@ -1284,24 +1315,41 @@ async function tmdbGet(path, queryParams = {}) {
     // 忽略日志异常
   }
 
-  const response = await OmniBox.request(url.toString(), {
-    method: "GET",
-    headers: {
-      Accept: "application/json",
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari",
-      ...(tmdbAuth.mode === "query"
-        ? {}
-        : { Authorization: `Bearer ${tmdbAuth.value}` }),
-    },
-  });
+  const sharedProxyUrl = getSharedProxyUrl();
+  const axiosProxy = buildAxiosProxyConfig(sharedProxyUrl, "TMDB");
+  if (axiosProxy.normalized) {
+    await OmniBox.log("info", `TMDB 启用共享代理: ${axiosProxy.normalized}`);
+  }
+
+  let response;
+  try {
+    response = await axios({
+      url: url.toString(),
+      method: "get",
+      headers: {
+        Accept: "application/json",
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari",
+        ...(tmdbAuth.mode === "query"
+          ? {}
+          : { Authorization: `Bearer ${tmdbAuth.value}` }),
+      },
+      timeout: 20000,
+      proxy: axiosProxy.proxy,
+      responseType: "text",
+      validateStatus: () => true,
+      maxRedirects: 5,
+    });
+  } catch (error) {
+    throw new Error(`TMDB axios 请求失败: ${error.message}`);
+  }
 
   const bodyStr =
-    typeof response.body === "string"
-      ? response.body
-      : String(response.body || "");
+    typeof response.data === "string"
+      ? response.data
+      : String(response.data || "");
   if (!bodyStr) {
-    throw new Error(`TMDB 响应体为空: ${response.statusCode}`);
+    throw new Error(`TMDB 响应体为空: ${response.status}`);
   }
 
   let data;
@@ -1311,21 +1359,21 @@ async function tmdbGet(path, queryParams = {}) {
     throw new Error(`TMDB JSON解析失败: ${e.message}`);
   }
 
-  if (response.statusCode !== 200) {
+  if (response.status !== 200) {
     // TMDB 通常会有 status_message，如 Invalid API key / You must be granted access...
     const statusMessage = data?.status_message || "";
     try {
       await OmniBox.log(
         "warn",
-        `TMDB 请求失败: ${path} http=${response.statusCode} status_message=${statusMessage}`,
+        `TMDB 请求失败: ${path} http=${response.status} status_message=${statusMessage}`,
       );
     } catch {
       // ignore
     }
   }
 
-  if (response.statusCode !== 200) {
-    const msg = data?.status_message || `HTTP ${response.statusCode}`;
+  if (response.status !== 200) {
+    const msg = data?.status_message || `HTTP ${response.status}`;
     throw new Error(`TMDB 请求失败: ${msg}`);
   }
 
