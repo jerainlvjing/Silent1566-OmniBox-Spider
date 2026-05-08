@@ -2,7 +2,7 @@
 // @author https://github.com/hjdhnx/drpy-node/blob/main/spider/js/%E4%B8%83%E5%91%B3%5B%E4%BC%98%5D.js
 // @description 刮削：支持，弹幕：支持，嗅探：支持，仅保留七味网盘线路的分组版本
 // @dependencies: axios, cheerio
-// @version      1.6.19
+// @version      1.6.21
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/网盘/七味分组.js
 
 const axios = require("axios");
@@ -14,7 +14,8 @@ const DANMU_API = process.env.DANMU_API || "";
 const PANCHECK_API = process.env.PANCHECK_API || "";
 const PANCHECK_ENABLED = String(process.env.PANCHECK_ENABLED || (PANCHECK_API ? "true" : "false")).toLowerCase() === "true";
 const PANCHECK_PLATFORMS = process.env.PANCHECK_PLATFORMS || "quark,baidu,uc,pan123,tianyi,cmcc,aliyun,xunlei,115";
-const QIWEI_115_COOKIE = process.env.QIWEI_115_COOKIE || process.env.WOOG_115_COOKIE || process.env.PAN_115_COOKIE || "";
+// 115 cookie 统一全局配置：与盘搜分组共用同一套环境变量
+const GLOBAL_115_COOKIE = process.env.PAN_115_COOKIE || process.env.GLOBAL_115_COOKIE || process.env.QIWEI_115_COOKIE || process.env.WOOG_115_COOKIE || process.env['115_COOKIE'] || "";
 
 function splitConfigList(value) {
     return String(value || "")
@@ -37,7 +38,7 @@ const SOURCE_NAMES_CONFIG = splitConfigList(process.env.SOURCE_NAMES_CONFIG || "
 const EXTERNAL_SERVER_PROXY_ENABLED = String(process.env.EXTERNAL_SERVER_PROXY_ENABLED || "false").toLowerCase() === "true";
 const DRIVE_ORDER = splitConfigList(process.env.DRIVE_ORDER || "baidu;tianyi;quark;uc;115;xunlei;ali;123pan").map((s) => s.toLowerCase());
 const QIWEI_CACHE_EX_SECONDS = Number(process.env.QIWEI_CACHE_EX_SECONDS || 43200);
-const QIWEI_115_MAGNET_CACHE_EX_SECONDS = Number(process.env.QIWEI_115_MAGNET_CACHE_EX_SECONDS || 2592000);
+const GLOBAL_115_MAGNET_CACHE_EX_SECONDS = Number(process.env.GLOBAL_115_MAGNET_CACHE_EX_SECONDS || process.env.QIWEI_115_MAGNET_CACHE_EX_SECONDS || 2592000);
 const QIWEI_PAN_CACHE_VERSION = "v4";
 const PAN_ROUTE_NAMES = SOURCE_NAMES_CONFIG.slice(0, MAX_PAN_VALID_ROUTES);
 
@@ -642,6 +643,12 @@ function build115MagnetPlayId(meta = {}) {
         fileName: String(meta.fileName || "").trim(),
         fileId: String(meta.fileId || "").trim(),
         pickcode: String(meta.pickcode || "").trim(),
+        sid: String(meta.sid || "").trim(),
+        fid: String(meta.fid || "").trim(),
+        v: String(meta.v || "").trim(),
+        e: String(meta.e || "").trim(),
+        s: String(meta.s || "").trim(),
+        n: meta.n || "",
     }), "utf8").toString("base64");
 }
 
@@ -2447,10 +2454,16 @@ async function matchDanmu(fileName = "") {
 
 function rewritePlayIdMeta(playId = "", patchMeta = {}) {
     const raw = String(playId || "").trim();
+    if (is115MagnetPlayId(raw, "115秒传")) {
+        const data = decode115MagnetPlayMeta(raw);
+        if (data?.kind === "115magnetplay") {
+            return build115MagnetPlayId({ ...data, ...patchMeta });
+        }
+    }
     if (!raw.includes("|||")) return raw;
-    const [mainPlayId, metaB64] = raw.split("|||");
-    const meta = { ...decodeMeta(metaB64 || ""), ...patchMeta };
-    return `${mainPlayId}|||${encodeMeta(meta)}`;
+    const [main, metaB64] = raw.split("|||");
+    const meta = decodeMeta(metaB64 || "");
+    return `${main}|||${encodeMeta({ ...meta, ...patchMeta })}`;
 }
 
 function normalizeScrapeFileName(value = "") {
@@ -2951,7 +2964,7 @@ async function detail(params, context = {}) {
                 logInfo("磁力线路开始同步秒传115", {
                     videoId,
                     lineIndex: parsed.lineIndex,
-                    has115Cookie: !!QIWEI_115_COOKIE,
+                    has115Cookie: !!GLOBAL_115_COOKIE,
                     magnetEpisodeCount,
                 });
                 for (const ep of rawEpisodes) {
@@ -3002,7 +3015,7 @@ async function detail(params, context = {}) {
                         videoId,
                         lineIndex: parsed.lineIndex,
                         magnetEpisodeCount,
-                        has115Cookie: !!QIWEI_115_COOKIE,
+                        has115Cookie: !!GLOBAL_115_COOKIE,
                         failures: convertFailures.slice(0, 5),
                     });
                 }
@@ -3355,17 +3368,17 @@ function normalize115OfflineFiles(files = []) {
 async function cache115MagnetResult(magnet, result) {
     const normalizedMagnet = String(magnet || "").trim();
     if (!normalizedMagnet || !result || !Array.isArray(result.files) || result.files.length === 0) return;
-    await setCachedJSON(build115MagnetCacheKey(normalizedMagnet), result, QIWEI_115_MAGNET_CACHE_EX_SECONDS);
+    await setCachedJSON(build115MagnetCacheKey(normalizedMagnet), result, GLOBAL_115_MAGNET_CACHE_EX_SECONDS);
 }
 
 async function pushMagnetTo115(magnet, options = {}) {
-    const cookie = QIWEI_115_COOKIE;
+    const cookie = GLOBAL_115_COOKIE;
     const normalizedMagnet = String(magnet || "").trim();
     const useCache = options.useCache !== false;
     const pollIntervalMs = Number(options.pollIntervalMs || 1500);
     const pollMaxAttempts = Number(options.pollMaxAttempts || 4);
     if (!cookie) {
-        logWarn("115秒传跳过: 未配置 QIWEI_115_COOKIE");
+        logWarn("115秒传跳过: 未配置 GLOBAL_115_COOKIE");
         return { ok: false, state: "no_cookie", files: [], magnet: normalizedMagnet };
     }
     if (!normalizedMagnet.startsWith("magnet:")) {
@@ -3527,7 +3540,7 @@ async function build115EpisodesFromMagnet(magnet, baseName = "115资源") {
 function build115Headers() {
     return {
         "User-Agent": DEFAULT_HEADERS["User-Agent"],
-        "Cookie": QIWEI_115_COOKIE,
+        "Cookie": GLOBAL_115_COOKIE,
         "Origin": "https://115.com",
         "Referer": "https://115.com/",
         "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -3542,7 +3555,7 @@ function same115FileName(a = "", b = "") {
 
 async function find115FileByName(fileName = "") {
     const targetName = String(fileName || "").trim();
-    if (!targetName || !QIWEI_115_COOKIE) return null;
+    if (!targetName || !GLOBAL_115_COOKIE) return null;
     const key = buildCacheKey("qiwei-group:115-file", targetName);
     const cached = await getCachedJSON(key);
     if (cached?.fid || cached?.pickcode) {
@@ -3567,7 +3580,7 @@ async function find115FileByName(fileName = "") {
     })).filter((item) => item.name && (item.fid || item.pickcode));
     const matched = normalized.find((item) => same115FileName(item.name, targetName)) || normalized[0] || null;
     logInfo("115文件搜索结果", { keyword, targetName, resultCount: normalized.length, matched: matched?.name || "" });
-    if (matched) await setCachedJSON(key, matched, QIWEI_115_MAGNET_CACHE_EX_SECONDS);
+    if (matched) await setCachedJSON(key, matched, GLOBAL_115_MAGNET_CACHE_EX_SECONDS);
     return matched;
 }
 
@@ -3603,7 +3616,7 @@ async function get115VideoPlayUrl(file) {
     throw lastError || new Error("115未返回可播放地址");
 }
 
-async function resolve115MagnetPlay(playId, flag, callerSource, context) {
+async function resolve115MagnetPlay(playId, flag, callerSource, context, params = {}) {
     const data = typeof playId === "object" && playId
         ? playId
         : decode115MagnetPlayMeta(playId);
@@ -3615,30 +3628,124 @@ async function resolve115MagnetPlay(playId, flag, callerSource, context) {
 
     const realFile = await find115FileByName(targetFile.name);
     if (!realFile) throw new Error("115网盘内未搜索到真实文件");
-    const playUrl = await get115VideoPlayUrl(realFile);
+
+    const metadataPromise = (async () => {
+        const metaResult = {
+            danmakuList: [],
+            scrapeTitle: "",
+            scrapePic: "",
+            episodeNumber: data.n || null,
+            episodeName: String(data.e || params.episodeName || "").trim(),
+            mappingMatched: false,
+            mappingFileId: "",
+            danmuFileName: "",
+        };
+        const videoIdForScrape = String(params.vodId || data.sid || "").trim();
+        if (!videoIdForScrape) {
+            logWarn("115秒传弹幕跳过: 缺少视频ID", { fileId: targetFileId, fileName: targetFile.name || data.fileName || "" });
+            return metaResult;
+        }
+        try {
+            const metadata = await OmniBox.getScrapeMetadata(videoIdForScrape);
+            if (!metadata || !metadata.scrapeData || !Array.isArray(metadata.videoMappings)) {
+                logWarn("115秒传弹幕跳过: 无刮削元数据", { videoId: videoIdForScrape, hasMetadata: !!metadata });
+                return metaResult;
+            }
+            const infoHash = result.infoHash || crypto.createHash("sha1").update(String(magnet || "")).digest("hex");
+            const syntheticFid = `115magnet:${infoHash}:${targetFile.id}`;
+            const epNo = Number(data.n || extractEpisodeNumber(data.e || targetFile.name || data.fileName || ""));
+            const mapping = findScrapeMapping(
+                metadata,
+                [data.fid, syntheticFid, targetFile._fid].filter(Boolean),
+                Number.isFinite(epNo) && epNo > 0 ? epNo : null,
+                targetFile.name || data.fileName || ""
+            );
+            if (!mapping) {
+                logWarn("115秒传弹幕未命中刮削映射", {
+                    videoId: videoIdForScrape,
+                    fid: data.fid || syntheticFid,
+                    fileId: targetFileId,
+                    fileName: targetFile.name || data.fileName || "",
+                    mappingPreview: metadata.videoMappings.slice(0, 3).map((item) => String(item?.fileId || "").slice(0, 120)),
+                });
+                return metaResult;
+            }
+
+            const scrapeData = metadata.scrapeData;
+            metaResult.mappingMatched = true;
+            metaResult.mappingFileId = String(mapping.fileId || "");
+            metaResult.scrapeTitle = scrapeData.title || "";
+            if (scrapeData.posterPath) {
+                metaResult.scrapePic = `https://image.tmdb.org/t/p/w500${scrapeData.posterPath}`;
+            }
+            if (mapping.episodeNumber) metaResult.episodeNumber = mapping.episodeNumber;
+            if (mapping.episodeName) metaResult.episodeName = buildScrapedEpisodeName(scrapeData, mapping, targetFile.name || data.fileName || "", data.e || "") || mapping.episodeName;
+
+            const fileName = buildScrapedDanmuFileName(
+                scrapeData,
+                metadata.scrapeType || "",
+                mapping,
+                String(params.vodName || data.v || scrapeData.title || "").trim(),
+                metaResult.episodeName
+            );
+            metaResult.danmuFileName = fileName;
+            if (fileName) {
+                const matchedDanmaku = typeof OmniBox.getDanmakuByFileName === "function"
+                    ? await OmniBox.getDanmakuByFileName(fileName)
+                    : await matchDanmu(fileName);
+                if (Array.isArray(matchedDanmaku) && matchedDanmaku.length > 0) {
+                    metaResult.danmakuList = matchedDanmaku;
+                }
+                logInfo("115秒传弹幕匹配完成", {
+                    videoId: videoIdForScrape,
+                    fileName,
+                    mappingFileId: metaResult.mappingFileId,
+                    danmakuCount: metaResult.danmakuList.length,
+                });
+            }
+        } catch (error) {
+            logWarn("读取115秒传弹幕元数据失败", { error: error.message || String(error) });
+        }
+        return metaResult;
+    })();
+
+    const [playUrlResult, metadataResult] = await Promise.allSettled([
+        get115VideoPlayUrl(realFile),
+        metadataPromise,
+    ]);
+    if (playUrlResult.status !== "fulfilled") {
+        throw playUrlResult.reason || new Error("115未返回可播放地址");
+    }
+    const playUrl = playUrlResult.value;
+    const metadataValue = metadataResult.status === "fulfilled" ? metadataResult.value : null;
+    const finalDanmaku = Array.isArray(metadataValue?.danmakuList) ? metadataValue.danmakuList : [];
     const playResult = {
         urls: [{ name: "115播放", url: playUrl }],
         flag: "115网盘",
         header: {
             "User-Agent": DEFAULT_HEADERS["User-Agent"],
             "Referer": "https://115.com/",
-            "Cookie": QIWEI_115_COOKIE,
+            "Cookie": GLOBAL_115_COOKIE,
         },
         parse: 0,
-        danmaku: [],
+        danmaku: finalDanmaku,
     };
     addPlayHistoryAsync({
         sourceId: context?.sourceId || "七味分组-115秒传",
-        vodId: magnet || targetFileId || realFile.fid || playUrl,
-        title: String(data.vodName || data.title || data.fileName || targetFile.name || "115秒传资源").trim(),
-        pic: "",
-        episode: realFile.name || targetFile.name || "",
-        episodeName: realFile.name || targetFile.name || "",
+        vodId: String(params.vodId || data.sid || magnet || targetFileId || realFile.fid || playUrl).trim(),
+        title: String(metadataValue?.scrapeTitle || params.vodName || data.v || data.title || data.fileName || targetFile.name || "115秒传资源").trim(),
+        pic: metadataValue?.scrapePic || "",
+        episode: String(metadataValue?.episodeName || data.e || realFile.name || targetFile.name || "").trim(),
+        episodeName: String(metadataValue?.episodeName || data.e || realFile.name || targetFile.name || "").trim(),
+        episodeNumber: metadataValue?.episodeNumber || data.n || null,
     });
     logInfo("115磁力文件播放地址返回", {
         fid: realFile.fid || "",
         pickcode: realFile.pickcode || "",
         fileName: realFile.name || targetFile.name,
+        mappingMatched: !!metadataValue?.mappingMatched,
+        episodeNumber: metadataValue?.episodeNumber || data.n || null,
+        danmakuCount: finalDanmaku.length,
         output: summarizePlayResultForLog(playResult),
     });
     return playResult;
@@ -3680,7 +3787,7 @@ async function play(params, context = {}) {
                 fileName: magnetMeta.fileName || "",
                 fileId: magnetMeta.fileId || "",
             });
-            return await resolve115MagnetPlay(playId, flag, callerSource, context);
+            return await resolve115MagnetPlay(playId, flag, callerSource, context, params);
         } catch (error) {
             logWarn("115磁力播放失败，回退磁力", { error: error.message || String(error), fileName: magnetMeta.fileName || playMeta.fileName || "" });
             if (magnetMeta.magnet) playId = magnetMeta.magnet;
