@@ -2,7 +2,7 @@
 // @author https://github.com/hjdhnx/drpy-node/blob/main/spider/js/%E4%B8%83%E5%91%B3%5B%E4%BC%98%5D.js
 // @description 刮削：支持，弹幕：支持，嗅探：支持
 // @dependencies: axios, cheerio
-// @version 1.2.10
+// @version 1.3.0
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/采集/七味.js
 
 /**
@@ -76,121 +76,72 @@ const CLASSES = [
     { type_id: "30", type_name: "短剧" },
 ];
 
-const FILTERS = {
-    "1": [
+const FULL_TYPE_OPTIONS = [
+    "剧情", "科幻", "动作", "喜剧", "爱情", "冒险", "儿童", "歌舞", "音乐", "奇幻", "动画", "恐怖", "惊悚", "丧尸", "战争", "传记", "纪录", "犯罪", "悬疑", "西部", "灾难", "古装", "武侠", "家庭", "短片", "校园", "文艺", "运动", "青春", "同性", "励志", "人性", "美食", "女性", "治愈", "历史",
+];
+const FULL_YEAR_OPTIONS = ["2026", "2025", "2024", "2023", "2022", "2021", "2020", "2019", "2018", "2017", "2016", "2015", "2014", "2013", "2012", "2011", "2010"];
+const FULL_AREA_OPTIONS = ["大陆", "香港", "台湾", "日本", "韩国", "泰国", "美国", "英国", "法国", "德国", "印度", "丹麦", "瑞典", "荷兰", "加拿大", "俄罗斯", "意大利", "比利时", "西班牙", "澳大利亚", "其他"];
+const FULL_LANG_OPTIONS = ["国语", "粤语", "英语", "法语", "日语", "韩语", "泰语", "德语", "俄语", "闽南语", "丹麦语", "波兰语", "瑞典语", "印地语", "挪威语", "意大利语", "西班牙语", "无对白", "其他"];
+const FULL_SORT_OPTIONS = [
+    { name: "按时间", value: "time" },
+    { name: "按人气", value: "hits" },
+    { name: "按评分", value: "score" },
+];
+
+function buildFilterOptionList(list = []) {
+    return [{ name: "全部", value: "" }, ...list.map((item) => ({ name: item, value: item }))];
+}
+
+function buildCategoryFilters({ includeType = true, includeYear = true, includeArea = true, includeLang = true } = {}) {
+    const filters = [
         {
             key: "sort",
             name: "排序",
             init: "time",
-            value: [
-                { name: "按时间", value: "time" },
-                { name: "按人气", value: "hits" },
-                { name: "按评分", value: "score" },
-            ],
+            value: FULL_SORT_OPTIONS,
         },
-        {
-            key: "year",
-            name: "年份",
-            init: "",
-            value: [
-                { name: "全部", value: "" },
-                { name: "2026", value: "2026" },
-                { name: "2025", value: "2025" },
-                { name: "2024", value: "2024" },
-                { name: "2023", value: "2023" },
-                { name: "2022", value: "2022" },
-            ],
-        },
-        {
-            key: "area",
-            name: "地区",
-            init: "",
-            value: [
-                { name: "全部", value: "" },
-                { name: "大陆", value: "大陆" },
-                { name: "香港", value: "香港" },
-                { name: "台湾", value: "台湾" },
-                { name: "日本", value: "日本" },
-                { name: "韩国", value: "韩国" },
-                { name: "美国", value: "美国" },
-            ],
-        },
-        {
-            key: "lang",
-            name: "语言",
-            init: "",
-            value: [
-                { name: "全部", value: "" },
-                { name: "国语", value: "国语" },
-                { name: "粤语", value: "粤语" },
-                { name: "英语", value: "英语" },
-                { name: "日语", value: "日语" },
-                { name: "韩语", value: "韩语" },
-            ],
-        },
-        {
+    ];
+    if (includeType) {
+        filters.push({
             key: "type",
             name: "类型",
             init: "",
-            value: [
-                { name: "全部", value: "" },
-                { name: "剧情", value: "剧情" },
-                { name: "动作", value: "动作" },
-                { name: "喜剧", value: "喜剧" },
-                { name: "爱情", value: "爱情" },
-                { name: "科幻", value: "科幻" },
-                { name: "悬疑", value: "悬疑" },
-            ],
-        },
-    ],
-    "2": [
-        {
-            key: "sort",
-            name: "排序",
-            init: "time",
-            value: [
-                { name: "按时间", value: "time" },
-                { name: "按人气", value: "hits" },
-                { name: "按评分", value: "score" },
-            ],
-        },
-    ],
-    "3": [
-        {
-            key: "sort",
-            name: "排序",
-            init: "time",
-            value: [
-                { name: "按时间", value: "time" },
-                { name: "按人气", value: "hits" },
-                { name: "按评分", value: "score" },
-            ],
-        },
-    ],
-    "4": [
-        {
-            key: "sort",
-            name: "排序",
-            init: "time",
-            value: [
-                { name: "按时间", value: "time" },
-                { name: "按人气", value: "hits" },
-                { name: "按评分", value: "score" },
-            ],
-        },
-    ],
-    "30": [
-        {
-            key: "sort",
-            name: "排序",
-            init: "time",
-            value: [
-                { name: "按时间", value: "time" },
-                { name: "按人气", value: "hits" },
-                { name: "按评分", value: "score" },
-            ],
-        },
-    ],
+            value: buildFilterOptionList(FULL_TYPE_OPTIONS),
+        });
+    }
+    if (includeYear) {
+        filters.push({
+            key: "year",
+            name: "年代",
+            init: "",
+            value: buildFilterOptionList(FULL_YEAR_OPTIONS),
+        });
+    }
+    if (includeArea) {
+        filters.push({
+            key: "area",
+            name: "地区",
+            init: "",
+            value: buildFilterOptionList(FULL_AREA_OPTIONS),
+        });
+    }
+    if (includeLang) {
+        filters.push({
+            key: "lang",
+            name: "语言",
+            init: "",
+            value: buildFilterOptionList(FULL_LANG_OPTIONS),
+        });
+    }
+    return filters;
+}
+
+const FILTERS = {
+    "1": buildCategoryFilters(),
+    "2": buildCategoryFilters(),
+    "3": buildCategoryFilters({ includeYear: false, includeArea: false, includeLang: false }),
+    "4": buildCategoryFilters({ includeArea: false, includeLang: false }),
+    "30": buildCategoryFilters({ includeArea: false, includeLang: false }),
 };
 
 const axiosInstance = axios.create({
@@ -565,7 +516,7 @@ function parsePage(value, fallback = 1) {
 
 function parseFilters(params = {}) {
     const merged = {};
-    const candidates = [params.filters, params.extend];
+    const candidates = [params.filters, params.extend, params.ext];
     for (const item of candidates) {
         if (!item) {
             continue;
@@ -585,7 +536,17 @@ function parseFilters(params = {}) {
             }
         }
     }
-    return merged;
+    const normalized = {};
+    for (const [key, value] of Object.entries(merged)) {
+        if (!["sort", "type", "area", "lang", "year"].includes(key)) {
+            continue;
+        }
+        normalized[key] = String(value || "").trim();
+    }
+    if (!FULL_SORT_OPTIONS.some((item) => item.value === normalized.sort)) {
+        normalized.sort = "time";
+    }
+    return normalized;
 }
 
 async function requestHtml(url, options = {}) {
@@ -715,11 +676,11 @@ function parseVideoList(html, host) {
 }
 
 function buildCategoryPath(categoryId, page, filters = {}) {
-    const area = String(filters.area || "").trim();
+    const area = encodeURIComponent(String(filters.area || "").trim());
     const sort = String(filters.sort || "time").trim() || "time";
-    const type = String(filters.type || "").trim();
-    const lang = String(filters.lang || "").trim();
-    const year = String(filters.year || "").trim();
+    const type = encodeURIComponent(String(filters.type || "").trim());
+    const lang = encodeURIComponent(String(filters.lang || "").trim());
+    const year = encodeURIComponent(String(filters.year || "").trim());
     return `/ms/${categoryId}-${area}-${sort}-${type}-${lang}-------${year}.html?page=${page}`;
 }
 

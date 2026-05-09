@@ -2,7 +2,7 @@
 // @author
 // @description 直连 Emby 接口，TVBox T4 结构输出（刮削：不支持，弹幕：不支持，嗅探：不支持）
 // @dependencies: axios
-// @version 1.0.0
+// @version 1.0.1
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/Emby/模板一.js
 
 /**
@@ -452,7 +452,10 @@ async function detail(params = {}) {
             const episodesData = await requestJson(`${episodesUrl}?${new URLSearchParams(episodeParams)}`, {}, header);
             const episodes = (episodesData.Items || []).map((episode) => {
               const compositePid = `${accountIndex}@${episode.Id}`;
-              const label = `${season.Name.replace(/#/g, "-").replace(/\$/g, "|").trim()}|${cleanText(episode.Name)}`;
+              const seasonLabel = season.IndexNumber ? `第${season.IndexNumber}季` : season.Name.replace(/#/g, "-").replace(/\$/g, "|").trim();
+              const episodeLabel = episode.IndexNumber ? `第${episode.IndexNumber}集` : cleanText(episode.Name);
+              const episodeName = cleanText(episode.Name);
+              const label = `${seasonLabel} ${episodeLabel}${episodeName && episodeName !== episodeLabel ? ` ${episodeName}` : ""}`.trim();
               return { name: label, playId: compositePid };
             });
 
@@ -475,10 +478,16 @@ async function detail(params = {}) {
           const itemsData = await requestJson(`${itemsUrl}?${new URLSearchParams(itemsParams)}`, {}, header);
           const episodes = (itemsData.Items || [])
             .filter((item) => !item.IsFolder)
-            .map((item) => ({
-              name: cleanText(item.Name).replace(/#/g, "-").replace(/\$/g, "|"),
-              playId: `${accountIndex}@${item.Id}`,
-            }));
+            .map((item) => {
+              const seasonLabel = item.ParentIndexNumber ? `第${item.ParentIndexNumber}季` : "";
+              const episodeLabel = item.IndexNumber ? `第${item.IndexNumber}集` : cleanText(item.Name);
+              const episodeName = cleanText(item.Name).replace(/#/g, "-").replace(/\$/g, "|");
+              const label = `${seasonLabel} ${episodeLabel}${episodeName && episodeName !== episodeLabel ? ` ${episodeName}` : ""}`.trim();
+              return {
+                name: label,
+                playId: `${accountIndex}@${item.Id}`,
+              };
+            });
 
           if (episodes.length > 0) {
             playSources.push({ name: "资源列表", episodes });

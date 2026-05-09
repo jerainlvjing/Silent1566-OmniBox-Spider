@@ -1,15 +1,15 @@
 // @name 电影人生
 // @author 梦
-// @description 页面解析：已接入；播放：解析页面 /api/m3u8 并跟随到最终可播 m3u8
+// @description 页面解析：已接入；播放优先直解析，失败后 SDK 嗅探，再失败交给播放器嗅探
 // @dependencies cheerio
-// @version 1.0.4
+// @version 1.1.0
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/采集/电影人生.js
 
 const OmniBox = require("omnibox_sdk");
 const runner = require("spider_runner");
 const cheerio = require("cheerio");
 
-const BASE_URL = "https://dyrsok.com";
+const BASE_URL = "https://www.dyrsok.com";
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
 
 module.exports = { home, category, detail, search, play };
@@ -341,6 +341,76 @@ async function search(params, context) {
   }
 }
 
+async function resolveApiM3u8FinalUrl(apiUrl, headers) {
+  let finalUrl = apiUrl;
+  try {
+    const probe = await OmniBox.request(apiUrl, {
+      method: "GET",
+      headers,
+      timeout: 15000,
+      redirect: 0,
+    });
+    const location = probe?.headers && (probe.headers.location || probe.headers.Location);
+    if (location) {
+      const redirected = absUrl(location);
+      finalUrl = redirected;
+      try {
+        const playlistText = await fetchText(redirected, { headers: { Referer: BASE_URL + "/" } });
+        const rawLine = playlistText.split(/\r?\n/).find((line) => /\/api\/m3u8\?id=.*raw=1/.test(line));
+        if (rawLine) {
+          finalUrl = absUrl(new URL(rawLine, redirected).toString());
+        }
+      } catch (error) {
+        await OmniBox.log("warn", `[电影人生][play] 解析主清单失败: ${error.message}`);
+      }
+    }
+  } catch (error) {
+    await OmniBox.log("warn", `[电影人生][play] 探测重定向失败: ${error.message}`);
+  }
+  return finalUrl;
+}
+
+async function trySdkSniff(targetUrl, headers, meta) {
+  if (!targetUrl || typeof OmniBox.sniffVideo !== "function") {
+    return null;
+  }
+  try {
+    await OmniBox.log("info", `[电影人生][play] SDK 嗅探开始 target=${targetUrl}`);
+    const sniffResult = await OmniBox.sniffVideo(targetUrl, headers);
+    const sniffUrl = sniffResult?.url || sniffResult?.playUrl || sniffResult?.src || sniffResult?.data?.url || "";
+    if (sniffUrl) {
+      await OmniBox.log("info", `[电影人生][play] SDK 嗅探成功 url=${sniffUrl}`);
+      return {
+        parse: 0,
+        url: sniffUrl,
+        urls: [{ name: meta.title || "播放页", url: sniffUrl }],
+        flag: sniffResult?.flag || "sniff",
+        header: headers,
+        headers,
+      };
+    }
+    await OmniBox.log("warn", `[电影人生][play] SDK 嗅探无可播地址 target=${targetUrl}`);
+  } catch (error) {
+    await OmniBox.log("warn", `[电影人生][play] SDK 嗅探失败: ${error?.message || String(error)}`);
+  }
+  return null;
+}
+
+function buildPlayerSniffFallback(targetUrl, headers, meta) {
+  return {
+    parse: 1,
+    url: targetUrl,
+    urls: [{ name: meta.title || "播放页", url: targetUrl }],
+    flag: "dyrs",
+    header: headers,
+    headers,
+  };
+}
+
+function looksLikeDirectMedia(url) {
+  return /\.(m3u8|mp4|m4v|flv|avi|mkv)(\?|$)/i.test(String(url || "")) || /\/api\/m3u8\?/i.test(String(url || ""));
+}
+
 async function play(params, context) {
   try {
     const raw = String(params.playId || params.play_id || "").trim();
@@ -366,41 +436,23 @@ async function play(params, context) {
 
     const html = await fetchText(safePageUrl, { headers: { Referer: BASE_URL + "/" } });
     const match = html.match(/\/api\/m3u8\?origin=([^"'\\\s&]+|[^"'\\\s]+?)(&amp;|\\u0026|&)url=([a-zA-Z0-9]+)/);
+    let directUrl = "";
+    let origin = "";
+
     if (match) {
-      const origin = decodeURIComponent(match[1].replace(/&amp;/g, "&"));
+      origin = decodeURIComponent(match[1].replace(/&amp;/g, "&"));
       const urlId = match[3];
-      let finalUrl = `${BASE_URL}/api/m3u8?origin=${encodeURIComponent(origin)}&url=${urlId}`;
+      const apiUrl = `${BASE_URL}/api/m3u8?origin=${encodeURIComponent(origin)}&url=${urlId}`;
+      directUrl = await resolveApiM3u8FinalUrl(apiUrl, headers);
+      await OmniBox.log("info", `[电影人生][play] 直解析候选 url=${directUrl}`);
+    }
 
-      try {
-        const probe = await OmniBox.request(finalUrl, {
-          method: "GET",
-          headers,
-          timeout: 15000,
-        });
-        const location = probe?.headers && (probe.headers.location || probe.headers.Location);
-        if (location) {
-          const redirected = absUrl(location);
-          finalUrl = redirected;
-
-          try {
-            const playlistText = await fetchText(redirected, { headers: { Referer: BASE_URL + "/" } });
-            const rawLine = playlistText.split(/\r?\n/).find((line) => /\/api\/m3u8\?id=.*raw=1/.test(line));
-            if (rawLine) {
-              finalUrl = absUrl(new URL(rawLine, redirected).toString());
-            }
-          } catch (e) {
-            await OmniBox.log("warn", `[电影人生][play] 解析主清单失败: ${e.message}`);
-          }
-        }
-      } catch (e) {
-        await OmniBox.log("warn", `[电影人生][play] 探测重定向失败: ${e.message}`);
-      }
-
+    if (directUrl && looksLikeDirectMedia(directUrl)) {
       Promise.resolve().then(async () => {
         let totalDuration;
         try {
-          await OmniBox.log("info", `[电影人生][play] 准备探测媒体信息并写入播放记录 title=${meta.title || ""}, origin=${origin}, finalUrl=${finalUrl}`);
-          const mediaInfo = await OmniBox.getVideoMediaInfo(finalUrl, headers);
+          await OmniBox.log("info", `[电影人生][play] 准备探测媒体信息并写入播放记录 title=${meta.title || ""}, origin=${origin}, finalUrl=${directUrl}`);
+          const mediaInfo = await OmniBox.getVideoMediaInfo(directUrl, headers);
           const duration = Number(mediaInfo?.format?.duration || 0);
           if (Number.isFinite(duration) && duration > 0) {
             totalDuration = Math.round(duration);
@@ -412,12 +464,12 @@ async function play(params, context) {
 
         try {
           const historyPayload = {
-            vodId: safePageUrl || finalUrl,
+            vodId: safePageUrl || directUrl,
             title: meta.vodName || meta.title || origin || "电影人生",
-            episode: safePageUrl || finalUrl,
+            episode: safePageUrl || directUrl,
             episodeName: meta.title || undefined,
             pic: meta.pic || undefined,
-            playUrl: finalUrl,
+            playUrl: directUrl,
             playHeader: headers,
             totalDuration,
           };
@@ -433,22 +485,27 @@ async function play(params, context) {
 
       const result = {
         parse: 0,
-        // url: finalUrl,
-        urls: [{ name: meta.title || "播放页", url: finalUrl }],
+        url: directUrl,
+        urls: [{ name: meta.title || "播放页", url: directUrl }],
         flag: "m3u8",
+        header: headers,
+        headers,
       };
-      await OmniBox.log("info", `[电影人生][play] 直返 ${finalUrl}`);
+      await OmniBox.log("info", `[电影人生][play] 直返 ${directUrl}`);
       return result;
     }
 
-    return {
-      parse: 1,
-      url: safePageUrl,
-      urls: [{ name: meta.title || "播放页", url: safePageUrl }],
-      flag: "dyrs",
-      header: headers,
-      headers,
-    };
+    const sdkSniffTarget = directUrl || safePageUrl;
+    if (sdkSniffTarget) {
+      const sniffResult = await trySdkSniff(sdkSniffTarget, headers, meta);
+      if (sniffResult) {
+        return sniffResult;
+      }
+      await OmniBox.log("warn", `[电影人生][play] SDK 嗅探失败，回退播放器嗅探 target=${sdkSniffTarget}`);
+      return buildPlayerSniffFallback(sdkSniffTarget, headers, meta);
+    }
+
+    return buildPlayerSniffFallback(safePageUrl, headers, meta);
   } catch (e) {
     await OmniBox.log("error", `[电影人生][play] ${e.message}`);
     return { parse: 1, url: "", urls: [], flag: "dyrs", header: {}, headers: {} };

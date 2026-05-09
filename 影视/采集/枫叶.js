@@ -1,8 +1,8 @@
 // @name 枫叶
 // @author 梦
-// @description 影视站：支持首页、分类、详情、搜索与播放，基于 https://www.budaichuchen.net
+// @description 影视站：支持首页、分类、详情、搜索与播放，补齐刮削、弹幕与播放记录，基于 https://www.budaichuchen.net
 // @dependencies cheerio
-// @version 1.0.1
+// @version 1.1.0
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/采集/枫叶.js
 
 const OmniBox = require("omnibox_sdk");
@@ -17,6 +17,114 @@ const PAGE_LIMIT = 20;
 const LIST_CACHE_TTL = Number(process.env.FENGYE_LIST_CACHE_TTL || 900);
 const DETAIL_CACHE_TTL = Number(process.env.FENGYE_DETAIL_CACHE_TTL || 1800);
 const SEARCH_CACHE_TTL = Number(process.env.FENGYE_SEARCH_CACHE_TTL || 600);
+
+function encodeMeta(meta = {}) {
+  try {
+    return Buffer.from(JSON.stringify(meta), "utf8").toString("base64url");
+  } catch (_) {
+    return "";
+  }
+}
+
+function decodeMeta(encoded = "") {
+  try {
+    if (!encoded) return {};
+    return JSON.parse(Buffer.from(String(encoded), "base64url").toString("utf8"));
+  } catch (_) {
+    return {};
+  }
+}
+
+function buildScrapedEpisodeName(scrapeData, mapping, originalName) {
+  if (!mapping || mapping.episodeNumber === 0 || (mapping.confidence && mapping.confidence < 0.5)) {
+    return originalName;
+  }
+  if (mapping.episodeName) {
+    return `${mapping.episodeNumber}.${mapping.episodeName}`;
+  }
+  if (scrapeData && Array.isArray(scrapeData.episodes)) {
+    const hit = scrapeData.episodes.find(
+      (ep) => ep.episodeNumber === mapping.episodeNumber && ep.seasonNumber === mapping.seasonNumber,
+    );
+    if (hit?.name) {
+      return `${hit.episodeNumber}.${hit.name}`;
+    }
+  }
+  return originalName;
+}
+
+function preprocessTitle(title) {
+  if (!title) return "";
+  return String(title)
+    .replace(/4[kK]|[xX]26[45]|720[pP]|1080[pP]|2160[pP]/g, " ")
+    .replace(/[hH]\.?26[45]/g, " ")
+    .replace(/BluRay|WEB-DL|HDR|REMUX/gi, " ")
+    .replace(/\.mp4|\.mkv|\.avi|\.flv/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function chineseToArabic(cn) {
+  const map = { 零: 0, 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10 };
+  if (!isNaN(cn)) return parseInt(cn, 10);
+  if (cn.length === 1) return map[cn] || cn;
+  if (cn.length === 2) {
+    if (cn[0] === "十") return 10 + map[cn[1]];
+    if (cn[1] === "十") return map[cn[0]] * 10;
+  }
+  if (cn.length === 3) return map[cn[0]] * 10 + map[cn[2]];
+  return cn;
+}
+
+function extractEpisode(title) {
+  if (!title) return "";
+  const processed = preprocessTitle(title);
+  const cnMatch = processed.match(/第\s*([零一二三四五六七八九十0-9]+)\s*[集话章节回期]/);
+  if (cnMatch) return String(chineseToArabic(cnMatch[1]));
+  const seMatch = processed.match(/[Ss](?:\d{1,2})?[-._\s]*[Ee](\d{1,3})/i);
+  if (seMatch) return seMatch[1];
+  const epMatch = processed.match(/\b(?:EP|E)[-._\s]*(\d{1,3})\b/i);
+  if (epMatch) return epMatch[1];
+  const bracketMatch = processed.match(/[\[\(【(](\d{1,3})[\]\)】)]/);
+  if (bracketMatch) {
+    const num = bracketMatch[1];
+    if (!["720", "1080", "480"].includes(num)) return num;
+  }
+  return "";
+}
+
+function buildFileNameForDanmu(vodName, episodeTitle) {
+  if (!vodName) return "";
+  if (!episodeTitle || episodeTitle === "正片" || episodeTitle === "播放") return vodName;
+  const digits = extractEpisode(episodeTitle);
+  if (digits) {
+    const epNum = parseInt(digits, 10);
+    if (epNum > 0) {
+      return epNum < 10 ? `${vodName} S01E0${epNum}` : `${vodName} S01E${epNum}`;
+    }
+  }
+  return vodName;
+}
+
+function buildScrapedDanmuFileName(scrapeData, scrapeType, mapping, fallbackVodName, fallbackEpisodeName) {
+  if (!scrapeData) return buildFileNameForDanmu(fallbackVodName, fallbackEpisodeName);
+  if (scrapeType === "movie") {
+    return scrapeData.title || fallbackVodName;
+  }
+  const title = scrapeData.title || fallbackVodName;
+  const seasonAirYear = scrapeData.seasonAirYear || "";
+  const seasonNumber = mapping?.seasonNumber || 1;
+  const episodeNumber = mapping?.episodeNumber || 1;
+  return `${title}.${seasonAirYear}.S${String(seasonNumber).padStart(2, "0")}E${String(episodeNumber).padStart(2, "0")}`;
+}
+
+function buildHistoryEpisode(playId, episodeNumber, episodeName) {
+  if (episodeNumber !== undefined && episodeNumber !== null && episodeNumber !== "") {
+    if (episodeName) return `第${episodeNumber}集 ${episodeName}`;
+    return `第${episodeNumber}集`;
+  }
+  return episodeName || playId || "播放";
+}
 
 const CATEGORY_CONFIG = [
   { id: "1", name: "电影" },
@@ -204,34 +312,55 @@ function parseDetail(htmlText, videoId) {
 
   const playSources = [];
   $(".anthology-list-box").each((idx, el) => {
+    const lineName = sourceNames[idx] || `线路${idx + 1}`;
     const episodes = [];
-    $(el).find("ul li a").each((__, a) => {
-      const name = normalizeText($(a).text());
-      const playId = extractPlayId($(a).attr("href") || "");
-      if (!name || !playId) return;
-      episodes.push({ name, playId });
+    $(el).find("ul li a").each((epIdx, a) => {
+      const name = normalizeText($(a).text()) || `第${epIdx + 1}集`;
+      const rawPlayId = extractPlayId($(a).attr("href") || "");
+      if (!rawPlayId) return;
+      const fid = `${videoId}#${lineName}#${epIdx}`;
+      const meta = {
+        sid: String(videoId || ""),
+        fid,
+        v: vodName || "",
+        e: name,
+        t: lineName,
+        i: epIdx,
+      };
+      episodes.push({ name, playId: `${rawPlayId}|||${encodeMeta(meta)}`, _fid: fid, _rawName: name });
     });
     episodes.reverse();
     if (episodes.length) {
-      playSources.push({
-        name: sourceNames[idx] || `线路${idx + 1}`,
-        episodes,
-      });
+      playSources.push({ name: lineName, episodes });
     }
   });
 
   if (!playSources.length) {
     const episodes = [];
-    $(".anthology-list-play a").each((_, a) => {
-      const name = normalizeText($(a).attr("title") || $(a).text());
-      const playId = extractPlayId($(a).attr("href") || "");
-      if (!name || !playId) return;
-      episodes.push({ name, playId });
+    $(".anthology-list-play a").each((epIdx, a) => {
+      const name = normalizeText($(a).attr("title") || $(a).text()) || `第${epIdx + 1}集`;
+      const rawPlayId = extractPlayId($(a).attr("href") || "");
+      if (!rawPlayId) return;
+      const fid = `${videoId}#播放列表#${epIdx}`;
+      const meta = {
+        sid: String(videoId || ""),
+        fid,
+        v: vodName || "",
+        e: name,
+        t: "播放列表",
+        i: epIdx,
+      };
+      episodes.push({ name, playId: `${rawPlayId}|||${encodeMeta(meta)}`, _fid: fid, _rawName: name });
     });
     if (episodes.length) {
       playSources.push({ name: "播放列表", episodes });
     }
   }
+
+  const normalizedPlaySources = playSources.map((source) => ({
+    name: source.name,
+    episodes: (source.episodes || []).map((ep) => ({ name: ep.name, playId: ep.playId })),
+  }));
 
   return {
     list: [{
@@ -239,8 +368,9 @@ function parseDetail(htmlText, videoId) {
       vod_name: vodName,
       vod_pic: vodPic,
       vod_content: vodContent,
-      vod_play_sources: playSources,
+      vod_play_sources: normalizedPlaySources,
     }],
+    _play_sources_for_scrape: playSources,
   };
 }
 
@@ -392,6 +522,77 @@ async function detail(params = {}) {
     const url = `${BASE_URL}/detail/${videoId}.html`;
     const html = await getCachedText(`fengye:detail:${videoId}`, DETAIL_CACHE_TTL, () => requestText(url));
     const result = parseDetail(html, videoId);
+    const vod = result.list?.[0];
+    const scrapePlaySources = Array.isArray(result._play_sources_for_scrape) ? result._play_sources_for_scrape : vod?.vod_play_sources || [];
+
+    if (vod && Array.isArray(scrapePlaySources) && scrapePlaySources.length > 0 && typeof OmniBox.processScraping === "function" && typeof OmniBox.getScrapeMetadata === "function") {
+      let scrapeData = null;
+      let videoMappings = [];
+      let scrapeType = "";
+      const scrapeCandidates = [];
+
+      for (const source of scrapePlaySources) {
+        for (const ep of source.episodes || []) {
+          const fid = ep._fid || decodeMeta(String(ep.playId || "").split("|||")[1] || "")?.fid || ep.playId;
+          if (!fid) continue;
+          scrapeCandidates.push({
+            fid,
+            file_id: fid,
+            file_name: ep._rawName || ep.name || "正片",
+            name: ep._rawName || ep.name || "正片",
+            format_type: "video",
+          });
+        }
+      }
+
+      await OmniBox.log("info", `[枫叶][detail] 刮削候选 videoId=${videoId} count=${scrapeCandidates.length} preview=${scrapeCandidates.slice(0, 3).map((item) => `${item.fid}=>${item.file_name}`).join(" | ")}`);
+      if (scrapeCandidates.length > 0) {
+        try {
+          const scrapeKeyword = normalizeText(vod.vod_name || "");
+          const scrapingResult = await OmniBox.processScraping(videoId, scrapeKeyword, scrapeKeyword, scrapeCandidates);
+          await OmniBox.log("info", `[枫叶][detail] 刮削完成 videoId=${videoId} keyword=${scrapeKeyword} result=${JSON.stringify(scrapingResult || {}).slice(0, 200)}`);
+          const metadata = await OmniBox.getScrapeMetadata(videoId);
+          scrapeData = metadata?.scrapeData || null;
+          videoMappings = Array.isArray(metadata?.videoMappings) ? metadata.videoMappings : [];
+          scrapeType = metadata?.scrapeType || "";
+          await OmniBox.log("info", `[枫叶][detail] 刮削元数据 videoId=${videoId} hasScrapeData=${!!scrapeData} mappings=${videoMappings.length} scrapeType=${scrapeType}`);
+        } catch (error) {
+          await OmniBox.log("warn", `[枫叶][detail] 刮削失败 videoId=${videoId}: ${error.message}`);
+        }
+      }
+
+      if (scrapeData) {
+        vod.vod_name = scrapeData.title || vod.vod_name;
+        if (scrapeData.posterPath) {
+          vod.vod_pic = `https://image.tmdb.org/t/p/w500${scrapeData.posterPath}`;
+        }
+        if (scrapeData.overview) {
+          vod.vod_content = scrapeData.overview;
+        }
+      }
+
+      for (const source of vod.vod_play_sources || []) {
+        for (const ep of source.episodes || []) {
+          const parts = String(ep.playId || "").split("|||");
+          const meta = decodeMeta(parts[1] || "");
+          const fid = meta?.fid;
+          if (!fid) continue;
+          const mapping = videoMappings.find((item) => item?.fileId === fid);
+          if (!mapping) continue;
+          const oldName = ep.name;
+          const newName = buildScrapedEpisodeName(scrapeData, mapping, oldName);
+          if (newName && newName !== oldName) {
+            ep.name = newName;
+            await OmniBox.log("info", `[枫叶][detail] 应用刮削分集名 ${oldName} -> ${newName}`);
+          }
+          meta.e = ep.name;
+          meta.s = mapping.seasonNumber;
+          meta.n = mapping.episodeNumber;
+          ep.playId = `${parts[0]}|||${encodeMeta(meta)}`;
+        }
+      }
+    }
+
     await OmniBox.log("info", `[枫叶][detail] id=${videoId} sources=${result.list?.[0]?.vod_play_sources?.length || 0}`);
     return result;
   } catch (e) {
@@ -400,42 +601,175 @@ async function detail(params = {}) {
   }
 }
 
-async function play(params = {}) {
+async function play(params = {}, context = {}) {
   try {
-    const playId = String(params.id || params.playId || "");
+    let rawPlayId = String(params.id || params.playId || "");
+    let playMeta = {};
+    let vodName = "";
+    let episodeName = "";
+
+    if (rawPlayId.includes("|||")) {
+      const [mainPlayId, metaB64] = rawPlayId.split("|||");
+      rawPlayId = mainPlayId;
+      playMeta = decodeMeta(metaB64 || "");
+      vodName = playMeta.v || "";
+      episodeName = playMeta.e || "";
+      await OmniBox.log("info", `[枫叶][play] 解析透传信息 vod=${vodName} episode=${episodeName} fid=${playMeta.fid || ""}`);
+    }
+
+    const playId = String(rawPlayId || "");
     if (!playId) return { parse: 1, url: "", urls: [], header: {}, flag: "fengye" };
     const playUrl = `${BASE_URL}/play/${playId}.html`;
-    const html = await requestText(playUrl);
-    const realVideoUrl = await parsePlayPage(playUrl, html);
-    const finalHeaders = {
-      "User-Agent": UA,
-      Referer: `${BASE_URL}/`,
-      Origin: BASE_URL,
-    };
 
-    if (realVideoUrl) {
-      await OmniBox.log("info", `[枫叶][play] direct success playId=${playId} url=${realVideoUrl}`);
+    const playInfoPromise = (async () => {
+      const html = await requestText(playUrl);
+      const realVideoUrl = await parsePlayPage(playUrl, html);
+      const finalHeaders = {
+        "User-Agent": UA,
+        Referer: `${BASE_URL}/`,
+        Origin: BASE_URL,
+      };
+
+      if (realVideoUrl) {
+        await OmniBox.log("info", `[枫叶][play] direct success playId=${playId} url=${realVideoUrl}`);
+        return {
+          parse: 0,
+          url: realVideoUrl,
+          urls: [{ name: "播放", url: realVideoUrl }],
+          header: finalHeaders,
+          headers: finalHeaders,
+          flag: "fengye",
+          danmaku: [],
+        };
+      }
+
+      await OmniBox.log("warn", `[枫叶][play] fallback parse=1 playId=${playId}`);
       return {
-        parse: 0,
-        url: realVideoUrl,
-        urls: [{ name: "播放", url: realVideoUrl }],
+        parse: 1,
+        url: playUrl,
+        urls: [{ name: "播放页", url: playUrl }],
         header: finalHeaders,
         headers: finalHeaders,
         flag: "fengye",
+        danmaku: [],
       };
+    })();
+
+    const metadataPromise = (async () => {
+      const result = {
+        danmakuList: [],
+        scrapeTitle: "",
+        scrapePic: "",
+        episodeNumber: playMeta?.n ?? null,
+        episodeName: episodeName || "",
+        scrapeType: "",
+        mapping: null,
+      };
+
+      const videoIdForScrape = String(playMeta?.sid || params.videoId || params.vod_id || "");
+      if (!videoIdForScrape || typeof OmniBox.getScrapeMetadata !== "function") {
+        await OmniBox.log("info", `[枫叶][play] 播放增强链路跳过 videoId=${videoIdForScrape || ""}`);
+        return result;
+      }
+
+      try {
+        const metadata = await OmniBox.getScrapeMetadata(videoIdForScrape);
+        if (!metadata || !metadata.scrapeData) {
+          await OmniBox.log("info", `[枫叶][play] 播放增强链路跳过: metadata 不完整 videoId=${videoIdForScrape}`);
+          return result;
+        }
+
+        result.scrapeTitle = metadata.scrapeData.title || "";
+        if (metadata.scrapeData.posterPath) {
+          result.scrapePic = `https://image.tmdb.org/t/p/w500${metadata.scrapeData.posterPath}`;
+        }
+        result.scrapeType = metadata.scrapeType || "";
+
+        const mappings = Array.isArray(metadata.videoMappings) ? metadata.videoMappings : [];
+        await OmniBox.log("info", `[枫叶][play] 读取刮削元数据成功 videoId=${videoIdForScrape} mappings=${mappings.length} scrapeType=${result.scrapeType || "unknown"}`);
+        const mapping = mappings.find((item) => item?.fileId === playMeta?.fid);
+        result.mapping = mapping || null;
+        if (mapping) {
+          if (mapping.episodeName) {
+            result.episodeName = buildScrapedEpisodeName(metadata.scrapeData, mapping, result.episodeName || episodeName || "");
+          }
+          if (mapping.episodeNumber !== undefined && mapping.episodeNumber !== null) {
+            result.episodeNumber = mapping.episodeNumber;
+          }
+        } else if (mappings.length > 0) {
+          await OmniBox.log("info", `[枫叶][play] 播放增强链路未命中 mapping fid=${playMeta?.fid || ""}`);
+        }
+
+        vodName = result.scrapeTitle || vodName;
+        episodeName = result.episodeName || episodeName;
+        const fileName = buildScrapedDanmuFileName(metadata.scrapeData, result.scrapeType, mapping, vodName, episodeName);
+        if (fileName && typeof OmniBox.getDanmakuByFileName === "function") {
+          const matchedDanmaku = await OmniBox.getDanmakuByFileName(fileName);
+          const count = Array.isArray(matchedDanmaku) ? matchedDanmaku.length : 0;
+          await OmniBox.log("info", `[枫叶][play] 弹幕匹配结果 fileName=${fileName} count=${count}`);
+          if (count > 0) {
+            result.danmakuList = matchedDanmaku;
+          }
+        }
+      } catch (error) {
+        await OmniBox.log("warn", `[枫叶][play] 读取刮削元数据失败: ${error.message}`);
+      }
+
+      return result;
+    })();
+
+    const [playInfoResult, metadataResult] = await Promise.allSettled([playInfoPromise, metadataPromise]);
+    if (playInfoResult.status !== "fulfilled") {
+      throw playInfoResult.reason || new Error("播放主链路失败");
     }
 
-    await OmniBox.log("warn", `[枫叶][play] fallback parse=1 playId=${playId}`);
-    return {
-      parse: 1,
-      url: playUrl,
-      urls: [{ name: "播放页", url: playUrl }],
-      header: finalHeaders,
-      headers: finalHeaders,
-      flag: "fengye",
-    };
+    const playResult = playInfoResult.value || { urls: [], parse: 0, header: {}, danmaku: [] };
+    let danmakuList = [];
+    let scrapeTitle = "";
+    let scrapePic = "";
+    let episodeNumber = playMeta?.n ?? null;
+    if (metadataResult.status === "fulfilled" && metadataResult.value) {
+      danmakuList = metadataResult.value.danmakuList || [];
+      scrapeTitle = metadataResult.value.scrapeTitle || "";
+      scrapePic = metadataResult.value.scrapePic || "";
+      if (metadataResult.value.episodeNumber !== undefined && metadataResult.value.episodeNumber !== null) {
+        episodeNumber = metadataResult.value.episodeNumber;
+      }
+      episodeName = metadataResult.value.episodeName || episodeName;
+      vodName = scrapeTitle || vodName;
+    } else if (metadataResult.status === "rejected") {
+      await OmniBox.log("warn", `[枫叶][play] 播放增强链路失败(不影响播放): ${metadataResult.reason?.message || metadataResult.reason}`);
+    }
+
+    playResult.danmaku = danmakuList.length > 0 ? danmakuList : (playResult.danmaku || []);
+
+    const videoIdForScrape = String(playMeta?.sid || params.videoId || params.vod_id || "");
+    if (videoIdForScrape && context?.sourceId && typeof OmniBox.addPlayHistory === "function") {
+      const historyPayload = {
+        vodId: videoIdForScrape,
+        title: scrapeTitle || vodName || playMeta.v || "枫叶视频",
+        pic: scrapePic || "",
+        episode: buildHistoryEpisode(playId, episodeNumber, episodeName),
+        sourceId: context.sourceId,
+        episodeNumber,
+        episodeName: episodeName || "",
+      };
+      OmniBox.addPlayHistory(historyPayload)
+        .then((added) => {
+          if (added) {
+            OmniBox.log("info", `[枫叶][play] 已添加播放记录: ${historyPayload.title}`);
+          } else {
+            OmniBox.log("info", `[枫叶][play] 播放记录已存在，跳过添加: ${historyPayload.title}`);
+          }
+        })
+        .catch((error) => {
+          OmniBox.log("warn", `[枫叶][play] 添加播放记录失败: ${error.message}`);
+        });
+    }
+
+    return playResult;
   } catch (e) {
     await OmniBox.log("error", `[枫叶][play] ${e.message}`);
-    return { parse: 1, url: "", urls: [], header: {}, flag: "fengye" };
+    return { parse: 1, url: "", urls: [], header: {}, flag: "fengye", danmaku: [] };
   }
 }

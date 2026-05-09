@@ -1,7 +1,7 @@
 // @name 瓜子APP
 // @author 
 // @description 刮削：支持，弹幕：支持，嗅探：支持
-// @version 1.0.7
+// @version 1.0.8
 // @dependencies: axios, crypto
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/采集/瓜子.js
 
@@ -1160,6 +1160,7 @@ async function play(params) {
         if (parts.length < 2) {
             playResponse = {
                 urls: [{ name: '播放', url: playId }],
+                header: {"User-Agent": "com.android.chrome/5.0.6 (Linux;Android 9)  AndroidXMedia3/1.9.2"},
                 parse: 0 
             };
         } else {
@@ -1185,7 +1186,7 @@ async function play(params) {
 
             playResponse = {
                 urls: [{ name: '播放', url: playUrl }],
-                // header:config.headers,
+                header: {"User-Agent": "com.android.chrome/5.0.6 (Linux;Android 9)  AndroidXMedia3/1.9.2"},
                 parse: 0
             };
         }

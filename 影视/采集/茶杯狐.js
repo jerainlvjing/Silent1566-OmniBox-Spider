@@ -1,8 +1,8 @@
 // @name 茶杯狐
 // @author 梦
-// @description 影视站：支持首页、分类、详情与播放；搜索受站点人机验证影响，失败时安全降级
+// @description 影视站：支持首页、分类、详情、刮削、弹幕、播放记录与播放；搜索受站点人机验证影响，失败时安全降级
 // @dependencies cheerio
-// @version 1.0.13
+// @version 1.1.0
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/采集/茶杯狐.js
 
 const OmniBox = require("omnibox_sdk");
@@ -270,6 +270,81 @@ function categoryNameById(categoryId) {
   return CATEGORY_CONFIG.find((item) => item.id === String(categoryId))?.name || "影视";
 }
 
+function buildScrapeResourceId(detailUrl) {
+  const raw = String(detailUrl || "").trim();
+  const match = raw.match(/\/video\/(\d+)\.html/i);
+  return String(match?.[1] || raw);
+}
+
+function encodeMeta(obj) {
+  try {
+    return Buffer.from(JSON.stringify(obj || {}), "utf8").toString("base64");
+  } catch (_) {
+    return "";
+  }
+}
+
+function decodeMeta(str) {
+  try {
+    const raw = Buffer.from(String(str || ""), "base64").toString("utf8");
+    return JSON.parse(raw || "{}");
+  } catch (_) {
+    return {};
+  }
+}
+
+function extractEpisodeNumber(text) {
+  const value = cleanDisplayText(text);
+  if (!value) return null;
+  const match = value.match(/第\s*(\d+)\s*[集话期]/) || value.match(/(?:EP|E)(\d{1,4})/i) || value.match(/^(\d{1,4})$/);
+  if (!match) return null;
+  const num = Number(match[1]);
+  return Number.isFinite(num) && num > 0 ? num : null;
+}
+
+function buildDanmakuFileName(vodName, episodeTitle) {
+  const title = cleanDisplayText(vodName);
+  if (!title) return "";
+  const episode = cleanDisplayText(episodeTitle);
+  if (!episode || episode === "正片" || episode === "播放") {
+    return title;
+  }
+  const episodeNumber = extractEpisodeNumber(episode);
+  if (episodeNumber) {
+    return `${title} S01E${String(episodeNumber).padStart(2, "0")}`;
+  }
+  return title;
+}
+
+function buildScrapedEpisodeName(scrapeData, mapping, originalName) {
+  if (!mapping || mapping.episodeNumber === 0 || (mapping.confidence && mapping.confidence < 0.5)) {
+    return originalName;
+  }
+  const prefix = mapping.episodeNumber ? `第${mapping.episodeNumber}集 ` : "";
+  if (mapping.episodeName) {
+    return `${prefix}${mapping.episodeName}`.trim();
+  }
+  if (scrapeData && Array.isArray(scrapeData.episodes)) {
+    const hit = scrapeData.episodes.find(
+      (ep) => ep.episodeNumber === mapping.episodeNumber && ep.seasonNumber === mapping.seasonNumber,
+    );
+    if (hit?.name) {
+      return `${prefix}${hit.name}`.trim();
+    }
+  }
+  return originalName;
+}
+
+function buildHistoryEpisode(playId, episodeNumber, episodeName) {
+  if (episodeNumber !== undefined && episodeNumber !== null && episodeNumber !== "") {
+    return `${playId || ""}@@${episodeNumber}`;
+  }
+  if (episodeName) {
+    return `${playId || ""}@@${episodeName}`;
+  }
+  return playId || "";
+}
+
 function base64Decode(str) {
   const safe = String(str || "").replace(/[\r\n\s]/g, "");
   if (!safe) return "";
@@ -448,32 +523,52 @@ function parseDetail(htmlText, detailUrl) {
     tabs.push(name || `线路${tabs.length + 1}`);
   });
 
-  const playSources = [];
-  $("#tagContent .play_list_box").each((idx, box) => {
-    const tabName = tabs[idx] || `线路${idx + 1}`;
-    const episodes = [];
-    $(box).find("a.btn[href]").each((__, a) => {
-      const href = $(a).attr("href") || "";
-      const name = cleanDisplayText($(a).text());
-      if (!href || !name) return;
-      episodes.push({ name, playId: absoluteUrl(href) });
-    });
-    if (episodes.length) playSources.push({ name: tabName, episodes });
-  });
+      const playSources = [];
+      $("#tagContent .play_list_box").each((idx, box) => {
+        const tabName = tabs[idx] || `线路${idx + 1}`;
+        const episodes = [];
+        $(box).find("a.btn[href]").each((epIdx, a) => {
+          const href = $(a).attr("href") || "";
+          const name = cleanDisplayText($(a).text()) || `第${epIdx + 1}集`;
+          if (!href) return;
+          const fid = `${detailUrl}#${tabName}#${epIdx}`;
+          const meta = {
+            sid: detailUrl,
+            fid,
+            v: title || "",
+            e: name,
+            t: tabName,
+            i: epIdx,
+          };
+          episodes.push({
+            name,
+            playId: `${absoluteUrl(href)}|||${encodeMeta(meta)}`,
+            _fid: fid,
+            _rawName: name,
+          });
+        });
+        if (episodes.length) playSources.push({ name: tabName, episodes });
+      });
 
-  return {
-    list: [{
-      vod_id: detailUrl,
-      vod_name: title,
-      vod_pic: pic,
-      type_name: typeTags.join(" / "),
-      vod_remarks: cleanDisplayText(infoData["状态"] || ""),
-      vod_actor: formatPeopleText(infoData["演员"] || ""),
-      vod_director: formatPeopleText(infoData["导演"] || ""),
-      vod_content: content,
-      vod_play_sources: playSources,
-    }],
-  };
+      const normalizedPlaySources = playSources.map((source) => ({
+        name: source.name,
+        episodes: (source.episodes || []).map((ep) => ({ name: ep.name, playId: ep.playId })),
+      }));
+
+      return {
+        list: [{
+          vod_id: detailUrl,
+          vod_name: title,
+          vod_pic: pic,
+          type_name: typeTags.join(" / "),
+          vod_remarks: cleanDisplayText(infoData["状态"] || ""),
+          vod_actor: formatPeopleText(infoData["演员"] || ""),
+          vod_director: formatPeopleText(infoData["导演"] || ""),
+          vod_content: content,
+          vod_play_sources: normalizedPlaySources,
+        }],
+        _play_sources_for_scrape: playSources,
+      };
 }
 
 async function home() {
@@ -519,6 +614,73 @@ async function detail(params = {}) {
     if (!videoId) return { list: [] };
     const html = await getCachedText(`cupfox:detail:${videoId}`, DETAIL_CACHE_TTL, () => requestText(videoId));
     const result = parseDetail(html, videoId);
+    const vod = result.list?.[0];
+    const resourceId = buildScrapeResourceId(videoId);
+    const scrapePlaySources = Array.isArray(result._play_sources_for_scrape) ? result._play_sources_for_scrape : vod?.vod_play_sources || [];
+    if (vod && Array.isArray(scrapePlaySources) && scrapePlaySources.length > 0) {
+      let scrapeData = null;
+      let videoMappings = [];
+      const scrapeCandidates = [];
+      for (const source of scrapePlaySources) {
+        for (const ep of source.episodes || []) {
+          const fid = ep._fid || decodeMeta(String(ep.playId || "").split("|||")[1] || "")?.fid || ep.playId;
+          if (!fid) continue;
+          scrapeCandidates.push({
+            fid,
+            file_id: fid,
+            file_name: ep._rawName || ep.name || "正片",
+            name: ep._rawName || ep.name || "正片",
+            format_type: "video",
+          });
+        }
+      }
+
+      await OmniBox.log("info", `[茶杯狐][detail] 刮削候选 resourceId=${resourceId} count=${scrapeCandidates.length} preview=${scrapeCandidates.slice(0, 3).map((item) => `${item.fid}=>${item.file_name}`).join(" | ")}`);
+      if (scrapeCandidates.length > 0 && typeof OmniBox.processScraping === "function" && typeof OmniBox.getScrapeMetadata === "function") {
+        try {
+          const scrapeKeyword = cleanDisplayText(vod.vod_name || "");
+          const scrapingResult = await OmniBox.processScraping(resourceId, scrapeKeyword, scrapeKeyword, scrapeCandidates);
+          await OmniBox.log("info", `[茶杯狐][detail] 刮削完成 resourceId=${resourceId} keyword=${scrapeKeyword} result=${JSON.stringify(scrapingResult || {}).slice(0, 200)}`);
+          const metadata = await OmniBox.getScrapeMetadata(resourceId);
+          scrapeData = metadata?.scrapeData || null;
+          videoMappings = Array.isArray(metadata?.videoMappings) ? metadata.videoMappings : [];
+          await OmniBox.log("info", `[茶杯狐][detail] 刮削元数据 resourceId=${resourceId} hasScrapeData=${!!scrapeData} mappings=${videoMappings.length} scrapeType=${metadata?.scrapeType || ""}`);
+        } catch (error) {
+          await OmniBox.log("warn", `[茶杯狐][detail] 刮削失败 resourceId=${resourceId}: ${error.message}`);
+        }
+      }
+
+      if (scrapeData) {
+        vod.vod_name = scrapeData.title || vod.vod_name;
+        if (scrapeData.posterPath) {
+          vod.vod_pic = `https://image.tmdb.org/t/p/w500${scrapeData.posterPath}`;
+        }
+        if (scrapeData.overview) {
+          vod.vod_content = scrapeData.overview;
+        }
+      }
+
+      for (const source of vod.vod_play_sources) {
+        for (const ep of source.episodes || []) {
+          const parts = String(ep.playId || "").split("|||");
+          const meta = decodeMeta(parts[1] || "");
+          const fid = meta?.fid;
+          if (!fid) continue;
+          const mapping = videoMappings.find((item) => item?.fileId === fid);
+          if (!mapping) continue;
+          const oldName = ep.name;
+          const newName = buildScrapedEpisodeName(scrapeData, mapping, oldName);
+          if (newName && newName !== oldName) {
+            ep.name = newName;
+            await OmniBox.log("info", `[茶杯狐][detail] 应用刮削分集名 ${oldName} -> ${newName}`);
+          }
+          meta.e = ep.name;
+          meta.s = mapping.seasonNumber;
+          meta.n = mapping.episodeNumber;
+          ep.playId = `${parts[0]}|||${encodeMeta(meta)}`;
+        }
+      }
+    }
     await OmniBox.log("info", `[茶杯狐][detail] id=${videoId} sources=${result.list?.[0]?.vod_play_sources?.length || 0}`);
     return result;
   } catch (e) {
@@ -557,9 +719,23 @@ async function search(params = {}) {
   }
 }
 
-async function play(params = {}) {
+async function play(params = {}, context = {}) {
   try {
-    const playId = absoluteUrl(params.id || params.playId || "");
+    let rawPlayId = String(params.id || params.playId || "");
+    let playMeta = {};
+    let vodName = "";
+    let episodeName = "";
+
+    if (rawPlayId.includes("|||")) {
+      const [mainPlayId, metaB64] = rawPlayId.split("|||");
+      rawPlayId = mainPlayId;
+      playMeta = decodeMeta(metaB64 || "");
+      vodName = playMeta.v || "";
+      episodeName = playMeta.e || "";
+      await OmniBox.log("info", `[茶杯狐][play] 解析透传信息 vod=${vodName} episode=${episodeName} fid=${playMeta.fid || ""}`);
+    }
+
+    const playId = absoluteUrl(rawPlayId);
     if (!playId) return { parse: 1, url: "", urls: [], header: {}, flag: "cupfox" };
 
     const pageHeaders = {
@@ -567,134 +743,250 @@ async function play(params = {}) {
       Referer: BASE_URL + "/",
     };
 
-    const html = await requestText(playId, { headers: pageHeaders });
-    const playerData = extractPlayerData(html);
-    const vid = String(playerData?.url || "").trim();
-    await OmniBox.log(
-      "info",
-      `[茶杯狐][play] player data from=${playerData?.from || ""} server=${playerData?.server || ""} id=${playerData?.id || ""} sid=${playerData?.sid ?? ""} nid=${playerData?.nid ?? ""} encrypt=${playerData?.encrypt ?? ""} trysee=${playerData?.trysee ?? ""} points=${playerData?.points ?? ""} link=${playerData?.link || ""} vid=${vid.slice(0, 120)}`,
-    );
+    const playInfoPromise = (async () => {
+      const html = await requestText(playId, { headers: pageHeaders });
+      const playerData = extractPlayerData(html);
+      const vid = String(playerData?.url || "").trim();
+      await OmniBox.log(
+        "info",
+        `[茶杯狐][play] player data from=${playerData?.from || ""} server=${playerData?.server || ""} id=${playerData?.id || ""} sid=${playerData?.sid ?? ""} nid=${playerData?.nid ?? ""} encrypt=${playerData?.encrypt ?? ""} trysee=${playerData?.trysee ?? ""} points=${playerData?.points ?? ""} link=${playerData?.link || ""} vid=${vid.slice(0, 120)}`,
+      );
 
-    if (vid) {
-      const muiplayerUrl = `${BASE_URL}/foxplay/muiplayer.php?vid=${encodeURIComponent(vid)}`;
-      const apiBody = new URLSearchParams({ vid }).toString();
-      await OmniBox.log("info", `[茶杯狐][play] foxplay request body=${apiBody}`);
-      const apiRes = await requestTextNative(`${BASE_URL}/foxplay/api.php`, {
-        method: "POST",
-        headers: {
-          "User-Agent": UA,
-          Referer: muiplayerUrl,
-          Origin: BASE_URL,
-          "X-Requested-With": "XMLHttpRequest",
-          "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-          Accept: "*/*",
-        },
-        body: apiBody,
-      });
-
-      const apiRaw = String(apiRes?.body || "");
-      await OmniBox.log("info", `[茶杯狐][play] api raw=${apiRaw.slice(0, 1200)}`);
-
-      let apiJson = null;
-      try {
-        apiJson = JSON.parse(apiRaw);
-      } catch (parseError) {
-        await OmniBox.log("warn", `[茶杯狐][play] api json parse failed: ${parseError.message}`);
-      }
-
-      if (apiJson) {
-        await OmniBox.log(
-          "info",
-          `[茶杯狐][play] api parsed code=${apiJson.code} message=${apiJson.message || ""} dataKeys=${Object.keys(apiJson.data || {}).join(",")} unique=${apiJson?.data?.unique || ""} player=${apiJson?.data?.player || ""}`,
-        );
-        if (Number(apiJson.code) === 403 || /vid empty/i.test(String(apiJson.message || ""))) {
-          await OmniBox.log(
-            "warn",
-            `[茶杯狐][play] api rejected request code=${apiJson.code} message=${apiJson.message || ""} unique=${apiJson?.data?.unique || ""} probable_cause=vid_format_or_signature_mismatch`,
-          );
-        }
-      }
-
-      if (apiJson?.data?.url) {
-        const decodedUrl = decodeCupfoxPlayUrl(apiJson.data);
-        await OmniBox.log(
-          "info",
-          `[茶杯狐][play] api decode detail mode=${apiJson.data.urlmode || 0} type=${apiJson.data.type || ""} encrypt=${apiJson.data.encrypt ?? ""} raw=${String(apiJson.data.url || "").slice(0, 300)} decoded=${String(decodedUrl || "").slice(0, 300)}`,
-        );
-        if (decodedUrl && !isCupfoxPlaceholderUrl(decodedUrl)) {
-          const finalHeaders = {
+      if (vid) {
+        const muiplayerUrl = `${BASE_URL}/foxplay/muiplayer.php?vid=${encodeURIComponent(vid)}`;
+        const apiBody = new URLSearchParams({ vid }).toString();
+        await OmniBox.log("info", `[茶杯狐][play] foxplay request body=${apiBody}`);
+        const apiRes = await requestTextNative(`${BASE_URL}/foxplay/api.php`, {
+          method: "POST",
+          headers: {
             "User-Agent": UA,
             Referer: muiplayerUrl,
-          };
-          await OmniBox.log("info", `[茶杯狐][play] api decode success code=${apiJson.code} mode=${apiJson.data.urlmode || 0} type=${apiJson.data.type || ""} url=${decodedUrl}`);
-          return {
-            parse: 0,
-            url: decodedUrl,
-            urls: [{ name: "播放", url: decodedUrl }],
-            header: finalHeaders,
-            headers: finalHeaders,
-            flag: "cupfox",
-          };
-        }
-        await OmniBox.log("warn", `[茶杯狐][play] api decode invalid code=${apiJson.code} mode=${apiJson.data.urlmode || 0} type=${apiJson.data.type || ""} url=${String(decodedUrl || "").slice(0, 200)} raw=${String(apiJson.data.url || "").slice(0, 200)}`);
-      } else {
-        await OmniBox.log("warn", `[茶杯狐][play] api unexpected response=${apiRaw.slice(0, 1200)}`);
-      }
-      await OmniBox.log("warn", `[茶杯狐][play] foxplay api returned no direct url, fallback sniff vid=${vid}`);
-    } else {
-      await OmniBox.log("warn", `[茶杯狐][play] 未找到 player_aaaa.url，fallback sniff page`);
-    }
+            Origin: BASE_URL,
+            "X-Requested-With": "XMLHttpRequest",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            Accept: "*/*",
+          },
+          body: apiBody,
+        });
 
-    const sniffTargets = [];
-    if (vid) {
+        const apiRaw = String(apiRes?.body || "");
+        await OmniBox.log("info", `[茶杯狐][play] api raw=${apiRaw.slice(0, 1200)}`);
+
+        let apiJson = null;
+        try {
+          apiJson = JSON.parse(apiRaw);
+        } catch (parseError) {
+          await OmniBox.log("warn", `[茶杯狐][play] api json parse failed: ${parseError.message}`);
+        }
+
+        if (apiJson) {
+          await OmniBox.log(
+            "info",
+            `[茶杯狐][play] api parsed code=${apiJson.code} message=${apiJson.message || ""} dataKeys=${Object.keys(apiJson.data || {}).join(",")} unique=${apiJson?.data?.unique || ""} player=${apiJson?.data?.player || ""}`,
+          );
+          if (Number(apiJson.code) === 403 || /vid empty/i.test(String(apiJson.message || ""))) {
+            await OmniBox.log(
+              "warn",
+              `[茶杯狐][play] api rejected request code=${apiJson.code} message=${apiJson.message || ""} unique=${apiJson?.data?.unique || ""} probable_cause=vid_format_or_signature_mismatch`,
+            );
+          }
+        }
+
+        if (apiJson?.data?.url) {
+          const decodedUrl = decodeCupfoxPlayUrl(apiJson.data);
+          await OmniBox.log(
+            "info",
+            `[茶杯狐][play] api decode detail mode=${apiJson.data.urlmode || 0} type=${apiJson.data.type || ""} encrypt=${apiJson.data.encrypt ?? ""} raw=${String(apiJson.data.url || "").slice(0, 300)} decoded=${String(decodedUrl || "").slice(0, 300)}`,
+          );
+          if (decodedUrl && !isCupfoxPlaceholderUrl(decodedUrl)) {
+            const finalHeaders = {
+              "User-Agent": UA,
+              Referer: muiplayerUrl,
+            };
+            await OmniBox.log("info", `[茶杯狐][play] api decode success code=${apiJson.code} mode=${apiJson.data.urlmode || 0} type=${apiJson.data.type || ""} url=${decodedUrl}`);
+            return {
+              parse: 0,
+              url: decodedUrl,
+              urls: [{ name: "播放", url: decodedUrl }],
+              header: finalHeaders,
+              headers: finalHeaders,
+              flag: "cupfox",
+            };
+          }
+          await OmniBox.log("warn", `[茶杯狐][play] api decode invalid code=${apiJson.code} mode=${apiJson.data.urlmode || 0} type=${apiJson.data.type || ""} url=${String(decodedUrl || "").slice(0, 200)} raw=${String(apiJson.data.url || "").slice(0, 200)}`);
+        } else {
+          await OmniBox.log("warn", `[茶杯狐][play] api unexpected response=${apiRaw.slice(0, 1200)}`);
+        }
+        await OmniBox.log("warn", `[茶杯狐][play] foxplay api returned no direct url, fallback sniff vid=${vid}`);
+      } else {
+        await OmniBox.log("warn", `[茶杯狐][play] 未找到 player_aaaa.url，fallback sniff page`);
+      }
+
+      const sniffTargets = [];
+      if (vid) {
+        sniffTargets.push({
+          name: "muiplayer",
+          url: `${BASE_URL}/foxplay/muiplayer.php?vid=${encodeURIComponent(vid)}`,
+          headers: {
+            "User-Agent": UA,
+            Referer: playId,
+          },
+        });
+      }
       sniffTargets.push({
-        name: "muiplayer",
-        url: `${BASE_URL}/foxplay/muiplayer.php?vid=${encodeURIComponent(vid)}`,
+        name: "play-page",
+        url: playId,
         headers: {
           "User-Agent": UA,
           Referer: playId,
         },
       });
-    }
-    sniffTargets.push({
-      name: "play-page",
-      url: playId,
-      headers: {
-        "User-Agent": UA,
-        Referer: playId,
-      },
-    });
 
-    for (const target of sniffTargets) {
-      try {
-        await OmniBox.log("info", `[茶杯狐][play] sniff target=${target.name} url=${target.url}`);
-        const sniffed = await OmniBox.sniffVideo(target.url, target.headers);
-        if (sniffed?.url && !isCupfoxPlaceholderUrl(sniffed.url)) {
-          await OmniBox.log("info", `[茶杯狐][play] sniff success target=${target.name} url=${sniffed.url}`);
-          return {
-            parse: 0,
-            url: sniffed.url,
-            urls: [{ name: "播放", url: sniffed.url }],
-            header: sniffed.header || sniffed.headers || target.headers || {},
-            headers: sniffed.header || sniffed.headers || target.headers || {},
-            flag: "cupfox",
-          };
+      for (const target of sniffTargets) {
+        try {
+          await OmniBox.log("info", `[茶杯狐][play] sniff target=${target.name} url=${target.url}`);
+          const sniffed = await OmniBox.sniffVideo(target.url, target.headers);
+          if (sniffed?.url && !isCupfoxPlaceholderUrl(sniffed.url)) {
+            await OmniBox.log("info", `[茶杯狐][play] sniff success target=${target.name} url=${sniffed.url}`);
+            return {
+              parse: 0,
+              url: sniffed.url,
+              urls: [{ name: "播放", url: sniffed.url }],
+              header: sniffed.header || sniffed.headers || target.headers || {},
+              headers: sniffed.header || sniffed.headers || target.headers || {},
+              flag: "cupfox",
+            };
+          }
+          await OmniBox.log("warn", `[茶杯狐][play] sniff empty/invalid target=${target.name} url=${String(sniffed?.url || "")}`);
+        } catch (sniffError) {
+          await OmniBox.log("warn", `[茶杯狐][play] sniff failed target=${target.name}: ${sniffError.message}`);
         }
-        await OmniBox.log("warn", `[茶杯狐][play] sniff empty/invalid target=${target.name} url=${String(sniffed?.url || "")}`);
-      } catch (sniffError) {
-        await OmniBox.log("warn", `[茶杯狐][play] sniff failed target=${target.name}: ${sniffError.message}`);
       }
+
+      const fallbackHeaders = { "User-Agent": UA, Referer: playId };
+      return {
+        parse: 1,
+        url: playId,
+        urls: [{ name: "播放页", url: playId }],
+        header: fallbackHeaders,
+        headers: fallbackHeaders,
+        flag: "cupfox",
+      };
+    })();
+
+    const metadataPromise = (async () => {
+      const result = {
+        danmakuList: [],
+        scrapeTitle: "",
+        scrapePic: "",
+        episodeNumber: playMeta?.n ?? null,
+        episodeName: episodeName || "",
+      };
+
+      if (!playMeta?.fid || !vodName || typeof OmniBox.getScrapeMetadata !== "function") {
+        await OmniBox.log("info", `[茶杯狐][play] 播放增强链路跳过 fid=${playMeta?.fid || ""} vod=${vodName || ""}`);
+        return result;
+      }
+
+      try {
+        const resourceId = buildScrapeResourceId(playMeta.sid || playMeta.fid.split("#")[0] || "");
+        const metadata = await OmniBox.getScrapeMetadata(resourceId);
+        if (!metadata || !metadata.scrapeData) {
+          await OmniBox.log("info", `[茶杯狐][play] 播放增强链路跳过: metadata 不完整 resourceId=${resourceId} sid=${playMeta.sid || ""}`);
+          return result;
+        }
+
+        result.scrapeTitle = metadata.scrapeData.title || "";
+        if (metadata.scrapeData.posterPath) {
+          result.scrapePic = `https://image.tmdb.org/t/p/w500${metadata.scrapeData.posterPath}`;
+        }
+
+        const mappings = Array.isArray(metadata.videoMappings) ? metadata.videoMappings : [];
+        await OmniBox.log("info", `[茶杯狐][play] 播放增强元数据 resourceId=${resourceId} mappings=${mappings.length} fid=${playMeta.fid}`);
+        const mapping = mappings.find((m) => m?.fileId === playMeta.fid);
+        if (mapping) {
+          if (mapping.episodeName) {
+            result.episodeName = buildScrapedEpisodeName(metadata.scrapeData, mapping, result.episodeName || episodeName || "");
+          }
+          if (mapping.episodeNumber !== undefined && mapping.episodeNumber !== null) {
+            result.episodeNumber = mapping.episodeNumber;
+          }
+        } else if (mappings.length > 0) {
+          await OmniBox.log("info", `[茶杯狐][play] 播放增强未命中 mapping expected=${playMeta.fid} preview=${mappings.slice(0, 2).map((item) => `${item?.fileId || "<empty>"}=>${item?.episodeName || ""}`).join(" | ")}`);
+        }
+
+        vodName = result.scrapeTitle || vodName;
+        episodeName = result.episodeName || episodeName;
+        const danmakuFileName = buildDanmakuFileName(vodName, episodeName);
+        if (danmakuFileName && typeof OmniBox.getDanmakuByFileName === "function") {
+          const matchedDanmaku = await OmniBox.getDanmakuByFileName(danmakuFileName);
+          const count = Array.isArray(matchedDanmaku) ? matchedDanmaku.length : 0;
+          await OmniBox.log("info", `[茶杯狐][play] 弹幕匹配 fileName=${danmakuFileName} count=${count}`);
+          if (count > 0) {
+            result.danmakuList = matchedDanmaku;
+          }
+        }
+      } catch (error) {
+        await OmniBox.log("info", `[茶杯狐][play] 读取刮削元数据失败: ${error.message}`);
+      }
+
+      return result;
+    })();
+
+    const [playInfoResult, metadataResult] = await Promise.allSettled([playInfoPromise, metadataPromise]);
+    if (playInfoResult.status !== "fulfilled") {
+      throw playInfoResult.reason || new Error("播放主链路失败");
     }
 
-    const fallbackHeaders = { "User-Agent": UA, Referer: playId };
-    return {
-      parse: 1,
-      url: playId,
-      urls: [{ name: "播放页", url: playId }],
-      header: fallbackHeaders,
-      headers: fallbackHeaders,
-      flag: "cupfox",
-    };
+    const playResult = playInfoResult.value || { urls: [], parse: 0, header: {} };
+    let danmakuList = [];
+    let scrapeTitle = "";
+    let scrapePic = "";
+    let episodeNumber = playMeta?.n ?? null;
+
+    if (metadataResult.status === "fulfilled" && metadataResult.value) {
+      danmakuList = metadataResult.value.danmakuList || [];
+      scrapeTitle = metadataResult.value.scrapeTitle || "";
+      scrapePic = metadataResult.value.scrapePic || "";
+      if (metadataResult.value.episodeNumber !== undefined && metadataResult.value.episodeNumber !== null) {
+        episodeNumber = metadataResult.value.episodeNumber;
+      }
+      episodeName = metadataResult.value.episodeName || episodeName;
+      vodName = scrapeTitle || vodName;
+    } else if (metadataResult.status === "rejected") {
+      await OmniBox.log("info", `[茶杯狐][play] 播放增强链路失败(不影响播放): ${metadataResult.reason?.message || metadataResult.reason}`);
+    }
+
+    if (playMeta?.fid && context?.sourceId && typeof OmniBox.addPlayHistory === "function") {
+      const videoIdForScrape = buildScrapeResourceId(playMeta.sid || playMeta.fid.split("#")[0] || "");
+      const historyPayload = {
+        vodId: videoIdForScrape,
+        title: scrapeTitle || vodName || playMeta.v || "茶杯狐视频",
+        pic: scrapePic || "",
+        episode: buildHistoryEpisode(playId, episodeNumber, episodeName),
+        sourceId: context.sourceId,
+        episodeNumber,
+        episodeName: episodeName || "",
+      };
+      OmniBox.addPlayHistory(historyPayload)
+        .then((added) => {
+          if (added) {
+            OmniBox.log("info", `[茶杯狐][play] 已添加播放记录: ${historyPayload.title}`);
+          } else {
+            OmniBox.log("info", `[茶杯狐][play] 播放记录已存在，跳过添加: ${historyPayload.title}`);
+          }
+        })
+        .catch((error) => {
+          OmniBox.log("info", `[茶杯狐][play] 添加播放记录失败: ${error.message}`);
+        });
+    } else {
+      await OmniBox.log("info", `[茶杯狐][play] 跳过播放记录 sourceId=${context?.sourceId || ""} fid=${playMeta?.fid || ""} hasApi=${typeof OmniBox.addPlayHistory === "function"}`);
+    }
+
+    if (danmakuList.length > 0) {
+      playResult.danmaku = danmakuList;
+    }
+    return playResult;
   } catch (e) {
     await OmniBox.log("error", `[茶杯狐][play] ${e.message}`);
     return { parse: 1, url: "", urls: [], header: {}, flag: "cupfox" };

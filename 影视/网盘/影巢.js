@@ -2,7 +2,7 @@
 // @author lampon
 // @description
 // @dependencies axios
-// @version 1.1.8
+// @version 1.1.14
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/网盘/影巢.js
 
 const OmniBox = require("omnibox_sdk");
@@ -41,8 +41,10 @@ const TMDB_IMAGE_POSTER_SIZE = process.env.TMDB_IMAGE_POSTER_SIZE || "w500"; // 
 const HDHIVE_API_BASE_URL =
   process.env.HDHIVE_API_BASE_URL || "https://hdhive.com/api/open";
 const HDHIVE_API_KEY = process.env.HDHIVE_API_KEY || "";
-// 可选：HDHive 请求代理地址（示例：http://127.0.0.1:7890）
-const HDHIVE_PROXY_URL = process.env.HDHIVE_PROXY_URL || "";
+// 公共上游 HTTP 代理（可选，TMDB / HDHive 共用；示例：http://127.0.0.1:7890）
+const UPSTREAM_HTTP_PROXY_URL = process.env.UPSTREAM_HTTP_PROXY_URL || process.env.HTTP_PROXY_URL || "";
+// 兼容旧变量：若未配置公共代理，则 HDHive 仍可单独使用旧的 HDHIVE_PROXY_URL
+const HDHIVE_PROXY_URL = process.env.HDHIVE_PROXY_URL || UPSTREAM_HTTP_PROXY_URL || "";
 // PanCheck 配置（可选）
 const PANCHECK_API = process.env.PANCHECK_API || "";
 const PANCHECK_ENABLED = true;
@@ -53,6 +55,13 @@ const HDHIVE_UNLOCK_RATE_LIMIT_ENABLED = String(process.env.HDHIVE_UNLOCK_RATE_L
 const HDHIVE_UNLOCK_RATE_LIMIT_WINDOW_MS = Number(process.env.HDHIVE_UNLOCK_RATE_LIMIT_WINDOW_MS || 60 * 1000);
 const HDHIVE_UNLOCK_RATE_LIMIT_MAX_CALLS = Number(process.env.HDHIVE_UNLOCK_RATE_LIMIT_MAX_CALLS || 3);
 const HDHIVE_UNLOCK_RATE_LIMIT_CACHE_KEY = process.env.HDHIVE_UNLOCK_RATE_LIMIT_CACHE_KEY || "yingchao:hdhive:unlock-rate-limit";
+// HDHive 任意接口 429 冷却配置（全局接口级别）
+const HDHIVE_API_COOLDOWN_CACHE_KEY = process.env.HDHIVE_API_COOLDOWN_CACHE_KEY || "yingchao:hdhive:api-cooldown";
+const HDHIVE_API_COOLDOWN_DEFAULT_SECONDS = Number(process.env.HDHIVE_API_COOLDOWN_DEFAULT_SECONDS || 300);
+const HDHIVE_RESOURCES_CACHE_PREFIX = process.env.HDHIVE_RESOURCES_CACHE_PREFIX || "yingchao:hdhive:resources";
+const HDHIVE_RESOURCES_CACHE_TTL_SECONDS = Number(process.env.HDHIVE_RESOURCES_CACHE_TTL_SECONDS || 24 * 60 * 60);
+const HDHIVE_UNLOCK_CACHE_PREFIX = process.env.HDHIVE_UNLOCK_CACHE_PREFIX || "yingchao:hdhive:unlock";
+const HDHIVE_UNLOCK_CACHE_TTL_SECONDS = Number(process.env.HDHIVE_UNLOCK_CACHE_TTL_SECONDS || 30 * 24 * 60 * 60);
 // 读取环境变量：支持多个网盘类型，用分号分割；仅这些网盘类型启用多线路
 const DRIVE_TYPE_CONFIG = (process.env.DRIVE_TYPE_CONFIG || "quark;uc")
   .split(";")
@@ -229,6 +238,175 @@ function extractYear(dateStr) {
   const s = safeString(dateStr);
   const m = s.match(/^(\d{4})/);
   return m ? m[1] : "";
+}
+
+function buildPosterUrl(posterPath, size = TMDB_IMAGE_POSTER_SIZE) {
+  const p = safeString(posterPath).trim();
+  if (!p) return "";
+  if (/^https?:\/\//i.test(p)) return p;
+  const normalizedPath = p.startsWith("/") ? p : `/${p}`;
+  return `${TMDB_IMAGE_BASE_URL}/${size}${normalizedPath}`;
+}
+
+function takeFirstNonEmpty(...values) {
+  for (const value of values) {
+    const text = safeString(value).trim();
+    if (text) return text;
+  }
+  return "";
+}
+
+function buildPeopleNames(items, limit = 5) {
+  if (!Array.isArray(items)) return "";
+  return items
+    .map((item) => takeFirstNonEmpty(item?.name, item?.original_name, item?.character))
+    .filter(Boolean)
+    .slice(0, limit)
+    .join(",");
+}
+
+function buildDirectorNames(crew, limit = 3) {
+  if (!Array.isArray(crew)) return "";
+  return crew
+    .filter(
+      (person) => person?.job === "Director" || person?.department === "Directing",
+    )
+    .map((person) => takeFirstNonEmpty(person?.name, person?.original_name))
+    .filter(Boolean)
+    .slice(0, limit)
+    .join(",");
+}
+
+function buildGenreNames(genres, limit = 4) {
+  if (!Array.isArray(genres)) return "";
+  return genres
+    .map((genre) => takeFirstNonEmpty(genre?.name))
+    .filter(Boolean)
+    .slice(0, limit)
+    .join("/");
+}
+
+function buildOriginNames(scrapeData, limit = 3) {
+  if (!scrapeData || typeof scrapeData !== "object") return "";
+  const countryCandidates = [
+    ...(Array.isArray(scrapeData.productionCountries)
+      ? scrapeData.productionCountries.map((item) => item?.name)
+      : []),
+    ...(Array.isArray(scrapeData.originCountry)
+      ? scrapeData.originCountry
+      : []),
+    ...(Array.isArray(scrapeData.origin_country)
+      ? scrapeData.origin_country
+      : []),
+  ];
+  return countryCandidates
+    .map((item) => safeString(item).trim())
+    .filter(Boolean)
+    .slice(0, limit)
+    .join("/");
+}
+
+function buildLanguageNames(scrapeData, limit = 3) {
+  if (!scrapeData || typeof scrapeData !== "object") return "";
+  const languageCandidates = [
+    ...(Array.isArray(scrapeData.spokenLanguages)
+      ? scrapeData.spokenLanguages.map((item) => item?.name)
+      : []),
+    ...(Array.isArray(scrapeData.spoken_languages)
+      ? scrapeData.spoken_languages.map((item) => item?.name)
+      : []),
+  ];
+  return languageCandidates
+    .map((item) => safeString(item).trim())
+    .filter(Boolean)
+    .slice(0, limit)
+    .join("/");
+}
+
+function getSharedProxyUrl() {
+  return safeString(UPSTREAM_HTTP_PROXY_URL).trim();
+}
+
+function buildAxiosProxyConfig(proxyUrl, logLabel = "上游") {
+  const raw = safeString(proxyUrl).trim();
+  if (!raw) {
+    return { proxy: false, normalized: "" };
+  }
+  try {
+    const parsedUrl = new URL(raw);
+    const proxy = {
+      protocol: parsedUrl.protocol.replace(":", ""),
+      host: parsedUrl.hostname,
+      port: parsedUrl.port
+        ? Number(parsedUrl.port)
+        : parsedUrl.protocol === "https:"
+          ? 443
+          : 80,
+    };
+    if (parsedUrl.username || parsedUrl.password) {
+      proxy.auth = {
+        username: decodeURIComponent(parsedUrl.username || ""),
+        password: decodeURIComponent(parsedUrl.password || ""),
+      };
+    }
+    const normalized = `${parsedUrl.protocol}//${parsedUrl.hostname}:${proxy.port}`;
+    return { proxy, normalized };
+  } catch (error) {
+    throw new Error(`${logLabel}代理地址无效: ${error.message}`);
+  }
+}
+
+function pickScrapeDetailFields(payload = {}, scrapeData = {}, fallback = {}) {
+  const releaseDate = takeFirstNonEmpty(scrapeData?.releaseDate, scrapeData?.release_date);
+  const voteAverageRaw =
+    scrapeData?.voteAverage ?? scrapeData?.vote_average ?? fallback?.voteAverage ?? fallback?.vote_average;
+  const actors = takeFirstNonEmpty(
+    buildPeopleNames(scrapeData?.credits?.cast, 5),
+    fallback?.vod_actor,
+  );
+  const directors = takeFirstNonEmpty(
+    buildDirectorNames(scrapeData?.credits?.crew, 3),
+    fallback?.vod_director,
+  );
+  const genres = takeFirstNonEmpty(
+    buildGenreNames(scrapeData?.genres, 4),
+    safeString(fallback?.type_name),
+  );
+  const area = takeFirstNonEmpty(buildOriginNames(scrapeData, 3), fallback?.vod_area);
+  const language = takeFirstNonEmpty(
+    buildLanguageNames(scrapeData, 3),
+    fallback?.vod_lang,
+  );
+
+  let score = safeString(fallback?.vod_douban_score);
+  if (!score && voteAverageRaw !== null && voteAverageRaw !== undefined && voteAverageRaw !== "") {
+    const scoreNum = Number(voteAverageRaw);
+    if (Number.isFinite(scoreNum) && scoreNum > 0) {
+      score = scoreNum.toFixed(1);
+    }
+  }
+
+  return {
+    vodName: takeFirstNonEmpty(payload.title, scrapeData?.title, scrapeData?.name),
+    vodPic: takeFirstNonEmpty(
+      buildPosterUrl(payload.posterPath),
+      buildPosterUrl(scrapeData?.posterPath),
+      buildPosterUrl(scrapeData?.poster_path),
+      fallback?.vod_pic,
+    ),
+    vodYear: takeFirstNonEmpty(payload.year, extractYear(releaseDate), fallback?.vod_year),
+    vodContent: takeFirstNonEmpty(
+      scrapeData?.overview,
+      payload.remark,
+      fallback?.vod_content,
+    ),
+    vodActor: actors,
+    vodDirector: directors,
+    vodArea: area,
+    vodLang: language,
+    typeName: genres,
+    vodDoubanScore: score,
+  };
 }
 
 function normalizeScrapeKeyword(keyword) {
@@ -692,9 +870,256 @@ async function markHDHiveRateLimitHit() {
   return next;
 }
 
+function toPositiveInt(value, fallback = 0) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.floor(n);
+}
+
+async function getHDHiveApiCooldownState() {
+  try {
+    const raw = await OmniBox.getCache(HDHIVE_API_COOLDOWN_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+    const until = Number(parsed?.until || 0);
+    if (!until || until <= Date.now()) {
+      try {
+        await OmniBox.deleteCache(HDHIVE_API_COOLDOWN_CACHE_KEY);
+      } catch (_) {
+        // ignore
+      }
+      return null;
+    }
+    return {
+      until,
+      retryAfterSeconds: toPositiveInt(parsed?.retryAfterSeconds, Math.ceil((until - Date.now()) / 1000)),
+      path: safeString(parsed?.path),
+      method: safeString(parsed?.method || "GET") || "GET",
+      scope: safeString(parsed?.scope),
+      code: safeString(parsed?.code),
+      message: safeString(parsed?.message),
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+async function setHDHiveApiCooldown(info = {}) {
+  const retryAfterSeconds = Math.max(
+    1,
+    toPositiveInt(info?.retryAfterSeconds, HDHIVE_API_COOLDOWN_DEFAULT_SECONDS),
+  );
+  const until = Date.now() + retryAfterSeconds * 1000;
+  const payload = {
+    until,
+    retryAfterSeconds,
+    path: safeString(info?.path),
+    method: safeString(info?.method || "GET") || "GET",
+    scope: safeString(info?.scope),
+    code: safeString(info?.code),
+    message: safeString(info?.message),
+  };
+  try {
+    await OmniBox.setCache(
+      HDHIVE_API_COOLDOWN_CACHE_KEY,
+      JSON.stringify(payload),
+      retryAfterSeconds,
+    );
+  } catch (_) {
+    // ignore
+  }
+  return payload;
+}
+
+async function clearHDHiveApiCooldown() {
+  try {
+    await OmniBox.deleteCache(HDHIVE_API_COOLDOWN_CACHE_KEY);
+  } catch (_) {
+    // ignore
+  }
+}
+
+function buildHDHiveCooldownMessage(state, fallbackPath = "") {
+  const remainSeconds = Math.max(
+    1,
+    toPositiveInt(
+      state?.retryAfterSeconds,
+      Math.ceil((Number(state?.until || 0) - Date.now()) / 1000),
+    ),
+  );
+  const scopeLabel = safeString(state?.scope) || "接口";
+  const message = safeString(state?.message) || "HDHive 接口触发 429 冷却";
+  const pathText = safeString(state?.path || fallbackPath);
+  return `${message}，限制对象=${scopeLabel}，Retry-After=${remainSeconds}s${pathText ? `，跳过 ${pathText}` : ""}`;
+}
+
+async function buildHDHiveRateLimitedResult(state, fallbackPath = "") {
+  const message = buildHDHiveCooldownMessage(state, fallbackPath);
+  await OmniBox.log("warn", message);
+  return {
+    success: false,
+    data: null,
+    message,
+    code: safeString(state?.code) || "429",
+    rateLimited: true,
+    retryAfterSeconds: Math.max(
+      1,
+      toPositiveInt(
+        state?.retryAfterSeconds,
+        Math.ceil((Number(state?.until || 0) - Date.now()) / 1000),
+      ),
+    ),
+    limitScope: safeString(state?.scope),
+  };
+}
+
+function buildHDHiveResourcesCacheKey(mediaType, tmdbId) {
+  return `${HDHIVE_RESOURCES_CACHE_PREFIX}:${safeString(mediaType).toLowerCase()}:${safeString(tmdbId)}`;
+}
+
+function buildHDHiveUnlockCacheKey(slug) {
+  return `${HDHIVE_UNLOCK_CACHE_PREFIX}:${safeString(slug)}`;
+}
+
+async function getHDHiveUnlockCached(slug) {
+  const normalizedSlug = safeString(slug);
+  if (!normalizedSlug) {
+    throw new Error("HDHive unlock 缓存参数不完整");
+  }
+
+  const cacheKey = buildHDHiveUnlockCacheKey(normalizedSlug);
+  try {
+    const raw = await OmniBox.getCache(cacheKey);
+    if (raw) {
+      const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+      await OmniBox.log("info", `HDHive unlock 缓存命中: slug=${normalizedSlug}`);
+      return {
+        success: true,
+        cached: true,
+        ...(parsed && typeof parsed === "object" ? parsed : {}),
+      };
+    }
+  } catch (error) {
+    await OmniBox.log(
+      "warn",
+      `HDHive unlock 读缓存失败: slug=${normalizedSlug} error=${error.message}`,
+    );
+  }
+
+  const resp = await requestHDHive("/resources/unlock", "POST", {
+    slug: normalizedSlug,
+  });
+
+  if (resp?.rateLimited) return resp;
+
+  const payload = {
+    success: resp?.success !== false,
+    data: resp?.data && typeof resp.data === "object" ? resp.data : {},
+    message: safeString(resp?.message),
+    code: safeString(resp?.code),
+  };
+
+  try {
+    await OmniBox.setCache(
+      cacheKey,
+      JSON.stringify(payload),
+      Math.max(1, toPositiveInt(HDHIVE_UNLOCK_CACHE_TTL_SECONDS, 30 * 24 * 60 * 60)),
+    );
+    await OmniBox.log("info", `HDHive unlock 已写缓存: slug=${normalizedSlug}`);
+  } catch (error) {
+    await OmniBox.log(
+      "warn",
+      `HDHive unlock 写缓存失败: slug=${normalizedSlug} error=${error.message}`,
+    );
+  }
+
+  return {
+    ...payload,
+    cached: false,
+  };
+}
+
+async function getHDHiveResourcesCached(mediaType, tmdbId) {
+  const normalizedMediaType = safeString(mediaType).toLowerCase();
+  const normalizedTmdbId = safeString(tmdbId);
+  if (!normalizedMediaType || !normalizedTmdbId) {
+    throw new Error("HDHive resources 缓存参数不完整");
+  }
+
+  const cacheKey = buildHDHiveResourcesCacheKey(
+    normalizedMediaType,
+    normalizedTmdbId,
+  );
+
+  try {
+    const raw = await OmniBox.getCache(cacheKey);
+    if (raw) {
+      const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+      const resources = getArray(parsed?.data);
+      const meta = parsed?.meta && typeof parsed.meta === "object" ? parsed.meta : {};
+      await OmniBox.log(
+        "info",
+        `HDHive resources 缓存命中: mediaType=${normalizedMediaType} tmdbId=${normalizedTmdbId} count=${resources.length}`,
+      );
+      return {
+        success: true,
+        data: resources,
+        meta,
+        cached: true,
+      };
+    }
+  } catch (error) {
+    await OmniBox.log(
+      "warn",
+      `HDHive resources 读缓存失败: mediaType=${normalizedMediaType} tmdbId=${normalizedTmdbId} error=${error.message}`,
+    );
+  }
+
+  const resp = await requestHDHive(
+    `/resources/${normalizedMediaType}/${normalizedTmdbId}`,
+    "GET",
+  );
+
+  if (resp?.rateLimited) return resp;
+
+  const payload = {
+    data: getArray(resp?.data),
+    meta: resp?.meta && typeof resp.meta === "object" ? resp.meta : {},
+  };
+
+  try {
+    await OmniBox.setCache(
+      cacheKey,
+      JSON.stringify(payload),
+      Math.max(1, toPositiveInt(HDHIVE_RESOURCES_CACHE_TTL_SECONDS, 24 * 60 * 60)),
+    );
+    await OmniBox.log(
+      "info",
+      `HDHive resources 已写缓存: mediaType=${normalizedMediaType} tmdbId=${normalizedTmdbId} count=${payload.data.length}`,
+    );
+  } catch (error) {
+    await OmniBox.log(
+      "warn",
+      `HDHive resources 写缓存失败: mediaType=${normalizedMediaType} tmdbId=${normalizedTmdbId} error=${error.message}`,
+    );
+  }
+
+  return {
+    success: true,
+    data: payload.data,
+    meta: payload.meta,
+    cached: false,
+  };
+}
+
 async function requestHDHive(path, method = "GET", bodyObj = null) {
   if (!HDHIVE_API_KEY) {
     throw new Error("HDHive API Key 未配置：请设置 HDHIVE_API_KEY");
+  }
+
+  const cooldownState = await getHDHiveApiCooldownState();
+  if (cooldownState) {
+    return buildHDHiveRateLimitedResult(cooldownState, path);
   }
 
   if (path === "/resources/unlock" && HDHIVE_UNLOCK_RATE_LIMIT_ENABLED) {
@@ -718,30 +1143,26 @@ async function requestHDHive(path, method = "GET", bodyObj = null) {
   if (method === "POST") headers["Content-Type"] = "application/json";
 
   await OmniBox.log("info", `HDHive 请求: ${method} ${path}`);
+  const sharedProxyUrl = getSharedProxyUrl();
+  const proxySource = safeString(UPSTREAM_HTTP_PROXY_URL).trim()
+    ? "UPSTREAM_HTTP_PROXY_URL"
+    : safeString(HDHIVE_PROXY_URL).trim()
+      ? "HDHIVE_PROXY_URL"
+      : "";
   // axios 代理配置（可选）
   let proxyConfig = false;
-  if (HDHIVE_PROXY_URL) {
+  if (sharedProxyUrl) {
     try {
-      const p = new URL(HDHIVE_PROXY_URL);
-      proxyConfig = {
-        protocol: p.protocol.replace(":", ""),
-        host: p.hostname,
-        port: p.port ? Number(p.port) : p.protocol === "https:" ? 443 : 80,
-      };
-      if (p.username || p.password) {
-        proxyConfig.auth = {
-          username: decodeURIComponent(p.username || ""),
-          password: decodeURIComponent(p.password || ""),
-        };
-      }
+      const parsedProxy = buildAxiosProxyConfig(sharedProxyUrl, "HDHive");
+      proxyConfig = parsedProxy.proxy;
       await OmniBox.log(
         "info",
-        `HDHive 启用代理: ${p.protocol}//${p.hostname}:${proxyConfig.port}`,
+        `HDHive 启用代理: ${parsedProxy.normalized}${proxySource ? ` source=${proxySource}` : ""}`,
       );
     } catch (e) {
       await OmniBox.log(
         "warn",
-        `HDHIVE_PROXY_URL 无效，忽略代理: ${e.message}`,
+        `${proxySource || "代理"} 无效，忽略代理: ${e.message}`,
       );
       proxyConfig = false;
     }
@@ -800,6 +1221,34 @@ async function requestHDHive(path, method = "GET", bodyObj = null) {
     );
     throw new Error(`HDHive JSON 解析失败: ${e.message}`);
   }
+
+  if (statusCode === 429) {
+    const retryAfterHeader =
+      responseHeaders["retry-after"] || responseHeaders["Retry-After"];
+    const retryAfterBody = data?.retry_after_seconds;
+    const retryAfterSeconds = Math.max(
+      1,
+      toPositiveInt(retryAfterHeader, toPositiveInt(retryAfterBody, HDHIVE_API_COOLDOWN_DEFAULT_SECONDS)),
+    );
+    const limitScope = safeString(data?.limit_scope_label || data?.limit_scope || "");
+    const code = safeString(data?.code || "429");
+    const message = safeString(data?.message || data?.description || "HDHive 接口触发 429");
+    const cooldown = await setHDHiveApiCooldown({
+      retryAfterSeconds,
+      path,
+      method,
+      scope: limitScope,
+      code,
+      message,
+    });
+    await OmniBox.log(
+      "warn",
+      `HDHive 429 冷却已写入: path=${path} retryAfter=${retryAfterSeconds}s scope=${limitScope || "unknown"} code=${code}`,
+    );
+    return buildHDHiveRateLimitedResult(cooldown, path);
+  }
+
+  await clearHDHiveApiCooldown();
 
   if (statusCode !== 200) {
     throw new Error(`HDHive HTTP ${statusCode}`);
@@ -866,24 +1315,41 @@ async function tmdbGet(path, queryParams = {}) {
     // 忽略日志异常
   }
 
-  const response = await OmniBox.request(url.toString(), {
-    method: "GET",
-    headers: {
-      Accept: "application/json",
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari",
-      ...(tmdbAuth.mode === "query"
-        ? {}
-        : { Authorization: `Bearer ${tmdbAuth.value}` }),
-    },
-  });
+  const sharedProxyUrl = getSharedProxyUrl();
+  const axiosProxy = buildAxiosProxyConfig(sharedProxyUrl, "TMDB");
+  if (axiosProxy.normalized) {
+    await OmniBox.log("info", `TMDB 启用共享代理: ${axiosProxy.normalized}`);
+  }
+
+  let response;
+  try {
+    response = await axios({
+      url: url.toString(),
+      method: "get",
+      headers: {
+        Accept: "application/json",
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari",
+        ...(tmdbAuth.mode === "query"
+          ? {}
+          : { Authorization: `Bearer ${tmdbAuth.value}` }),
+      },
+      timeout: 20000,
+      proxy: axiosProxy.proxy,
+      responseType: "text",
+      validateStatus: () => true,
+      maxRedirects: 5,
+    });
+  } catch (error) {
+    throw new Error(`TMDB axios 请求失败: ${error.message}`);
+  }
 
   const bodyStr =
-    typeof response.body === "string"
-      ? response.body
-      : String(response.body || "");
+    typeof response.data === "string"
+      ? response.data
+      : String(response.data || "");
   if (!bodyStr) {
-    throw new Error(`TMDB 响应体为空: ${response.statusCode}`);
+    throw new Error(`TMDB 响应体为空: ${response.status}`);
   }
 
   let data;
@@ -893,21 +1359,21 @@ async function tmdbGet(path, queryParams = {}) {
     throw new Error(`TMDB JSON解析失败: ${e.message}`);
   }
 
-  if (response.statusCode !== 200) {
+  if (response.status !== 200) {
     // TMDB 通常会有 status_message，如 Invalid API key / You must be granted access...
     const statusMessage = data?.status_message || "";
     try {
       await OmniBox.log(
         "warn",
-        `TMDB 请求失败: ${path} http=${response.statusCode} status_message=${statusMessage}`,
+        `TMDB 请求失败: ${path} http=${response.status} status_message=${statusMessage}`,
       );
     } catch {
       // ignore
     }
   }
 
-  if (response.statusCode !== 200) {
-    const msg = data?.status_message || `HTTP ${response.statusCode}`;
+  if (response.status !== 200) {
+    const msg = data?.status_message || `HTTP ${response.status}`;
     throw new Error(`TMDB 请求失败: ${msg}`);
   }
 
@@ -1322,10 +1788,22 @@ async function category(params, context) {
         };
       }
 
-      const hData = await requestHDHive(
-        `/resources/${panFolderInfo.mediaType}/${panFolderInfo.tmdbId}`,
-        "GET",
+      const hData = await getHDHiveResourcesCached(
+        panFolderInfo.mediaType,
+        panFolderInfo.tmdbId,
       );
+      if (hData?.rateLimited) {
+        await OmniBox.log(
+          "warn",
+          `tmdb.js category(HDHive-PanItems) 被限流短路: categoryId=${categoryId}`,
+        );
+        return {
+          page: 1,
+          pagecount: 1,
+          total: 0,
+          list: [],
+        };
+      }
       let resources = getArray(hData?.data).filter(
         (it) => normalizePanType(it?.pan_type) === panFolderInfo.panType,
       );
@@ -1420,10 +1898,22 @@ async function category(params, context) {
       }
 
       const hdhiveType = folderInfo.mediaType === "movie" ? "movie" : "tv";
-      const hData = await requestHDHive(
-        `/resources/${hdhiveType}/${folderInfo.tmdbId}`,
-        "GET",
+      const hData = await getHDHiveResourcesCached(
+        hdhiveType,
+        folderInfo.tmdbId,
       );
+      if (hData?.rateLimited) {
+        await OmniBox.log(
+          "warn",
+          `tmdb.js category(HDHive-PanFolders) 被限流短路: categoryId=${categoryId}`,
+        );
+        return {
+          page: 1,
+          pagecount: 1,
+          total: 0,
+          list: [],
+        };
+      }
       const resources = getArray(hData?.data);
       const total = asInt(hData?.meta?.total, resources.length);
 
@@ -1673,13 +2163,15 @@ async function detail(params, context) {
 
     await OmniBox.log("info", `tmdb.js detail 开始: slug=${payload.slug}`);
 
-    const unlockResp = await requestHDHive("/resources/unlock", "POST", {
-      slug: payload.slug,
-    });
+    const unlockResp = await getHDHiveUnlockCached(payload.slug);
     if (unlockResp?.rateLimited) {
       await OmniBox.log("warn", `tmdb.js detail 被限流短路: slug=${payload.slug}`);
       return { list: [] };
     }
+    await OmniBox.log(
+      "info",
+      `tmdb.js detail unlock来源: slug=${payload.slug} cached=${unlockResp?.cached === true}`,
+    );
     const shareURL = safeString(
       unlockResp?.data?.full_url || unlockResp?.data?.url,
     );
@@ -1861,12 +2353,22 @@ async function detail(params, context) {
     let tmdbOverview = payload.remark || scrapeData?.overview || "";
     let tmdbScore = "";
 
+    const detailFallbackFields = {
+      vod_pic: buildPoster(context, payload.posterPath),
+      vod_year: payload.year,
+      vod_content: payload.remark,
+      type_name: getTypeNameByMediaType(payload.mediaType || "movie"),
+      vod_remarks: safeString(unlockResp?.message || "HDHive资源"),
+    };
+
     // 尝试补齐 TMDB 元信息
     try {
       if (payload.mediaType && payload.tmdbId) {
         const tmdbDetail = await tmdbGet(
           `/${payload.mediaType}/${payload.tmdbId}`,
-          {},
+          {
+            append_to_response: "credits",
+          },
         );
         if (safeString(tmdbDetail?.title || tmdbDetail?.name)) {
           tmdbTitle = safeString(tmdbDetail?.title || tmdbDetail?.name);
@@ -1887,6 +2389,18 @@ async function detail(params, context) {
         ) {
           tmdbScore = Number(tmdbDetail.vote_average).toFixed(1);
         }
+        scrapeData = {
+          ...(scrapeData && typeof scrapeData === "object" ? scrapeData : {}),
+          ...tmdbDetail,
+          credits:
+            tmdbDetail?.credits ||
+            scrapeData?.credits ||
+            (scrapeData && typeof scrapeData === "object" ? scrapeData.credits : undefined),
+        };
+        await OmniBox.log(
+          "info",
+          `tmdb.js detail TMDB补齐成功: title=${safeString(tmdbDetail?.title || tmdbDetail?.name)}, hasCredits=${Array.isArray(tmdbDetail?.credits?.cast) || Array.isArray(tmdbDetail?.credits?.crew)}`,
+        );
       }
     } catch (e) {
       await OmniBox.log(
@@ -1895,23 +2409,47 @@ async function detail(params, context) {
       );
     }
 
+    const mergedDetailFields = pickScrapeDetailFields(
+      payload,
+      scrapeData || {},
+      {
+        ...detailFallbackFields,
+        vod_pic: tmdbPic || detailFallbackFields.vod_pic,
+        vod_year: tmdbYear || detailFallbackFields.vod_year,
+        vod_content: tmdbOverview || detailFallbackFields.vod_content,
+        vod_douban_score: tmdbScore,
+      },
+    );
+
+    await OmniBox.log(
+      "info",
+      `tmdb.js detail 元数据回填结果: title=${mergedDetailFields.vodName || ""}, actor=${mergedDetailFields.vodActor || ""}, director=${mergedDetailFields.vodDirector || ""}, area=${mergedDetailFields.vodArea || ""}, lang=${mergedDetailFields.vodLang || ""}, type=${mergedDetailFields.typeName || ""}, overviewLen=${safeString(mergedDetailFields.vodContent).length}`,
+    );
+
     const legacyPlayFields = buildLegacyPlayFields(playSources);
 
     return {
       list: [
         {
           vod_id: videoId,
-          vod_name: tmdbTitle || `资源 ${payload.slug}`,
-          vod_pic: tmdbPic,
-          type_name: getTypeNameByMediaType(payload.mediaType || "movie"),
-          vod_year: tmdbYear,
+          vod_name: mergedDetailFields.vodName || `资源 ${payload.slug}`,
+          vod_pic: mergedDetailFields.vodPic,
+          type_name:
+            mergedDetailFields.typeName ||
+            getTypeNameByMediaType(payload.mediaType || "movie"),
+          vod_year: mergedDetailFields.vodYear,
+          vod_area: mergedDetailFields.vodArea,
+          vod_lang: mergedDetailFields.vodLang,
+          vod_actor: mergedDetailFields.vodActor,
+          vod_director: mergedDetailFields.vodDirector,
           vod_remarks: safeString(unlockResp?.message || "HDHive资源"),
           vod_content:
-            tmdbOverview || `HDHive 资源，共 ${episodes.length} 个视频文件`,
+            mergedDetailFields.vodContent ||
+            `HDHive 资源，共 ${episodes.length} 个视频文件`,
           vod_play_sources: playSources,
           vod_play_from: legacyPlayFields.vod_play_from,
           vod_play_url: legacyPlayFields.vod_play_url,
-          vod_douban_score: tmdbScore,
+          vod_douban_score: mergedDetailFields.vodDoubanScore,
         },
       ],
     };
